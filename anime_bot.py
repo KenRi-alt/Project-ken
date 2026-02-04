@@ -11,7 +11,20 @@ from telegram.ext import (
     MessageHandler, filters, ContextTypes
 )
 from telegram.constants import ParseMode
-from anilist_api import AniListAPI, ImageGenerator
+
+
+# Change to:
+try:
+    from anilist_api import AniListAPI, ImageGenerator
+except ImportError:
+    # Create minimal fallback classes
+    class AniListAPI:
+        def __init__(self, *args, **kwargs):
+            pass
+    
+    class ImageGenerator:
+        def __init__(self):
+            pass
 
 # Configure logging
 logging.basicConfig(
