@@ -2,6 +2,7 @@
 """
 AnimeKuun Bot - Complete Anime/Manga Telegram Bot
 Main bot file with all commands and handlers
+Optimized for Railway deployment
 """
 
 import os
@@ -25,13 +26,12 @@ from telegram.constants import ParseMode, ChatType
 from telegram.error import TelegramError
 
 # =========== CONFIGURATION ===========
-# Get environment variables
 BOT_TOKEN = os.getenv("BOT_TOKEN", "8282052807:AAERvnTQKpqBxz23qW4eygRknkVcqy31NNw")
 ADMIN_IDS = [int(id.strip()) for id in os.getenv("ADMIN_IDS", "6108185460").split(",") if id.strip()]
 LOG_CHANNEL = os.getenv("LOG_CHANNEL", "-1003662720845")
 REDIS_URL = os.getenv("REDIS_URL", "redis://default:redispw@localhost:6379")
-CACHE_TTL = int(os.getenv("CACHE_TTL", "3600"))
-MAX_REQUESTS_PER_MINUTE = int(os.getenv("MAX_REQUESTS_PER_MINUTE", "30"))
+WEBHOOK_URL = os.getenv("RAILWAY_STATIC_URL", "")
+PORT = int(os.getenv("PORT", "8080"))
 
 # =========== LOGGING SETUP ===========
 logging.basicConfig(
@@ -87,7 +87,6 @@ class DummyRedis:
         return key in self.data
     
     def keys(self, pattern):
-        import re
         pattern = pattern.replace('*', '.*')
         return [k for k in self.data.keys() if re.match(pattern, k)]
     
@@ -151,52 +150,48 @@ class DummyRedis:
 
 # Initialize Redis
 try:
-    logger.info(f"Attempting to connect to Redis at: {REDIS_URL}")
+    logger.info(f"Connecting to Redis at: {REDIS_URL}")
     redis_client = redis.from_url(REDIS_URL, decode_responses=True)
-    # Test connection
     redis_client.ping()
-    logger.info("✅ Redis connected successfully")
+    logger.info("Redis connected successfully")
 except Exception as e:
-    logger.error(f"❌ Redis connection failed: {e}")
+    logger.error(f"Redis connection failed: {e}")
     redis_client = DummyRedis()
 
 # =========== API MODULE IMPORT ===========
-# Try to import anilist_api, create fallback if missing
 try:
     from anilist_api import AniListAPI, ImageGenerator
-    logger.info("✅ Successfully imported anilist_api module")
+    logger.info("Successfully imported anilist_api module")
 except ImportError as e:
-    logger.error(f"❌ Failed to import anilist_api: {e}")
+    logger.error(f"Failed to import anilist_api: {e}")
     logger.warning("Creating fallback API classes...")
     
-    # Create minimal fallback classes
     class AniListAPI:
-        """Fallback AniList API wrapper"""
         def __init__(self, rc):
             self.redis = rc
             logger.info("Using fallback AniListAPI")
         
         async def search_anime(self, query, page=1, per_page=10):
             return [
-                {"id": 1, "title": {"english": "Attack on Titan", "romaji": "Shingeki no Kyojin"}, "averageScore": 85, "popularity": 1, "format": "TV", "episodes": 75},
-                {"id": 2, "title": {"english": "One Piece", "romaji": "One Piece"}, "averageScore": 88, "popularity": 2, "format": "TV", "episodes": 1100},
-                {"id": 3, "title": {"english": "Demon Slayer", "romaji": "Kimetsu no Yaiba"}, "averageScore": 87, "popularity": 3, "format": "TV", "episodes": 55},
+                {"id": 16498, "title": {"english": "Attack on Titan", "romaji": "Shingeki no Kyojin"}, "averageScore": 85, "popularity": 1, "format": "TV", "episodes": 75},
+                {"id": 21, "title": {"english": "One Piece", "romaji": "One Piece"}, "averageScore": 88, "popularity": 2, "format": "TV", "episodes": 1100},
+                {"id": 101922, "title": {"english": "Demon Slayer", "romaji": "Kimetsu no Yaiba"}, "averageScore": 87, "popularity": 3, "format": "TV", "episodes": 55},
             ]
         
         async def get_anime(self, anime_id):
             return {
                 "id": anime_id,
-                "title": {"english": "Sample Anime", "romaji": "Sample Anime"},
+                "title": {"english": "Attack on Titan", "romaji": "Shingeki no Kyojin"},
                 "averageScore": 85,
                 "popularity": 100,
                 "format": "TV",
-                "episodes": 24,
+                "episodes": 75,
                 "status": "FINISHED",
-                "genres": ["Action", "Fantasy"],
-                "description": "This is a sample anime description.",
-                "coverImage": {"extraLarge": "https://example.com/image.jpg"},
-                "studios": {"edges": [{"node": {"name": "Studio Ghibli"}}]},
-                "favourites": 1000,
+                "genres": ["Action", "Drama", "Fantasy"],
+                "description": "Centuries ago, mankind was slaughtered to near extinction by monstrous humanoid creatures called Titans...",
+                "coverImage": {"extraLarge": "https://s4.anilist.co/file/anilistcdn/media/anime/cover/medium/bx16498-C6FPmWm59CyP.jpg"},
+                "studios": {"edges": [{"node": {"name": "Wit Studio"}}]},
+                "favourites": 100000,
                 "nextAiringEpisode": None
             }
         
@@ -220,12 +215,12 @@ except ImportError as e:
         
         async def search_character(self, query, page=1, per_page=10):
             return [
-                {"id": 1, "name": {"full": "Naruto Uzumaki"}, "image": {"large": ""}},
-                {"id": 2, "name": {"full": "Goku"}, "image": {"large": ""}},
+                {"id": 1, "name": {"full": "Eren Yeager"}, "image": {"large": ""}},
+                {"id": 2, "name": {"full": "Mikasa Ackerman"}, "image": {"large": ""}},
             ]
         
         async def get_character(self, character_id):
-            return {"id": character_id, "name": {"full": "Sample Character"}}
+            return {"id": character_id, "name": {"full": "Eren Yeager"}}
         
         async def search_staff(self, query, page=1, per_page=10):
             return []
@@ -246,7 +241,7 @@ except ImportError as e:
             return await self.search_manga("", per_page=per_page)
         
         async def get_random_anime(self, genre=None):
-            return await self.get_anime(1)
+            return await self.get_anime(16498)
         
         async def get_anime_news(self, anime_id):
             return []
@@ -285,7 +280,6 @@ except ImportError as e:
             pass
     
     class ImageGenerator:
-        """Fallback Image Generator"""
         def __init__(self):
             logger.info("Using fallback ImageGenerator")
         
@@ -311,8 +305,7 @@ class AnimeBot:
         self.app = None
         self.start_time = datetime.now()
         self.maintenance_mode = False
-        self.user_data = {}
-        self.group_data = {}
+        self.is_webhook = bool(WEBHOOK_URL)
         
     # =========== UTILITY METHODS ===========
     
@@ -322,44 +315,11 @@ class AnimeBot:
             if LOG_CHANNEL and self.app:
                 await self.app.bot.send_message(
                     chat_id=LOG_CHANNEL,
-                    text=f"📝 {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n{message}",
+                    text=f"{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n{message}",
                     parse_mode=ParseMode.HTML
                 )
         except Exception as e:
             logger.error(f"Failed to log to channel: {e}")
-    
-    def check_rate_limit(self, user_id: int) -> bool:
-        """Check if user exceeded rate limit"""
-        key = f"ratelimit:{user_id}"
-        current_minute = datetime.now().strftime("%Y%m%d%H%M")
-        minute_key = f"{key}:{current_minute}"
-        
-        requests = int(redis_client.get(minute_key) or 0)
-        if requests >= MAX_REQUESTS_PER_MINUTE:
-            return False
-        
-        redis_client.incr(minute_key)
-        redis_client.expire(minute_key, 60)
-        return True
-    
-    def format_time(self, seconds: int) -> str:
-        """Format seconds to human readable time"""
-        days = seconds // 86400
-        hours = (seconds % 86400) // 3600
-        minutes = (seconds % 3600) // 60
-        secs = seconds % 60
-        
-        parts = []
-        if days > 0:
-            parts.append(f"{days}d")
-        if hours > 0:
-            parts.append(f"{hours}h")
-        if minutes > 0:
-            parts.append(f"{minutes}m")
-        if secs > 0 or not parts:
-            parts.append(f"{secs}s")
-        
-        return " ".join(parts)
     
     def update_user_stats(self, user_id: int, username: str = "", first_name: str = "", last_name: str = ""):
         """Update user statistics"""
@@ -388,17 +348,34 @@ class AnimeBot:
         redis_client.hset(user_key, mapping=user_data)
         return user_data
     
-    # =========== COMMAND HANDLERS ===========
+    def format_time(self, seconds: int) -> str:
+        """Format seconds to human readable time"""
+        days = seconds // 86400
+        hours = (seconds % 86400) // 3600
+        minutes = (seconds % 3600) // 60
+        secs = seconds % 60
+        
+        parts = []
+        if days > 0:
+            parts.append(f"{days}d")
+        if hours > 0:
+            parts.append(f"{hours}h")
+        if minutes > 0:
+            parts.append(f"{minutes}m")
+        if secs > 0 or not parts:
+            parts.append(f"{secs}s")
+        
+        return " ".join(parts)
+    
+    # =========== BASIC COMMAND HANDLERS ===========
     
     async def start_command(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         """Handle /start command"""
         user = update.effective_user
         chat = update.effective_chat
         
-        # Update user stats
         self.update_user_stats(user.id, user.username, user.first_name, user.last_name)
         
-        # Update group stats if in group
         if chat.type in [ChatType.GROUP, ChatType.SUPERGROUP]:
             group_key = f"group:{chat.id}"
             group_data = redis_client.hgetall(group_key) or {}
@@ -412,7 +389,6 @@ class AnimeBot:
                 redis_client.hset(group_key, mapping=group_data)
                 redis_client.sadd('groups', chat.id)
         
-        # Welcome message
         welcome_text = (
             "🎌 <b>Welcome to AnimeKuun Bot!</b>\n\n"
             "Your ultimate AniList companion with <b>50+ commands</b>!\n\n"
@@ -427,7 +403,6 @@ class AnimeBot:
             "Made with ❤️ for anime fans worldwide!"
         )
         
-        # Create keyboard
         keyboard = [
             [InlineKeyboardButton("🔍 Search Anime", switch_inline_query_current_chat="search ")],
             [InlineKeyboardButton("📊 My Stats", callback_data="stats_me"),
@@ -444,8 +419,7 @@ class AnimeBot:
             disable_web_page_preview=True
         )
         
-        # Log
-        await self.log_to_channel(f"👤 User {user.id} (@{user.username}) started bot")
+        await self.log_to_channel(f"User {user.id} (@{user.username}) started bot")
         logger.info(f"User {user.id} started bot")
     
     async def help_command(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -500,17 +474,18 @@ class AnimeBot:
             "• <code>/admin</code> - Admin panel\n"
             "• <code>/help admin</code> - Admin commands\n\n"
             
-            "💡 <b>Tip:</b> Use inline mode: <code>@AnimeKuun_bot search</code>"
+            "💡 <b>Tip:</b> Use <code>@AnimeKuun_bot search</code> in any chat for inline search!"
         )
         
         await update.message.reply_text(help_text, parse_mode=ParseMode.HTML)
+    
+    # =========== ANIME COMMANDS ===========
     
     async def search_command(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         """Handle /search command"""
         if not context.args:
             await update.message.reply_text(
-                "Please provide a search query.\n"
-                "Example: <code>/search Attack on Titan</code>",
+                "Please provide a search query.\nExample: <code>/search Attack on Titan</code>",
                 parse_mode=ParseMode.HTML
             )
             return
@@ -522,29 +497,35 @@ class AnimeBot:
             results = await anilist_api.search_anime(query, page=1, per_page=5)
             
             if not results:
-                await update.message.reply_text("❌ No results found.")
+                await update.message.reply_text("No results found.")
                 return
             
-            message = "🔍 <b>Search Results:</b>\n\n"
+            message = "<b>Search Results:</b>\n\n"
+            keyboard = []
+            
             for i, item in enumerate(results, 1):
                 title = item.get('title', {}).get('english') or item.get('title', {}).get('romaji', 'N/A')
                 score = item.get('averageScore', 'N/A')
                 message += f"{i}. <b>{title}</b>\n"
-                message += f"   ⭐ Score: {score} | 🆔 <code>{item.get('id')}</code>\n\n"
+                message += f"   Score: {score} | ID: <code>{item.get('id')}</code>\n\n"
+                
+                keyboard.append([InlineKeyboardButton(
+                    f"{i}. {title[:30]}...",
+                    callback_data=f"anime_{item.get('id')}"
+                )])
             
-            message += "Use <code>/anime ID</code> to get details"
-            await update.message.reply_text(message, parse_mode=ParseMode.HTML)
+            reply_markup = InlineKeyboardMarkup(keyboard)
+            await update.message.reply_text(message, parse_mode=ParseMode.HTML, reply_markup=reply_markup)
             
         except Exception as e:
             logger.error(f"Search error: {e}")
-            await update.message.reply_text("❌ Error searching. Please try again.")
+            await update.message.reply_text("Error searching. Please try again.")
     
     async def anime_command(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         """Handle /anime command"""
         if not context.args:
             await update.message.reply_text(
-                "Please provide anime ID or title.\n"
-                "Example: <code>/anime 16498</code> or <code>/anime Attack on Titan</code>",
+                "Please provide anime ID or title.\nExample: <code>/anime 16498</code>",
                 parse_mode=ParseMode.HTML
             )
             return
@@ -560,30 +541,42 @@ class AnimeBot:
                 if results:
                     anime_data = await anilist_api.get_anime(results[0]['id'])
                 else:
-                    await update.message.reply_text("❌ Anime not found.")
+                    await update.message.reply_text("Anime not found.")
                     return
             
             if not anime_data:
-                await update.message.reply_text("❌ Failed to fetch anime data.")
+                await update.message.reply_text("Failed to fetch anime data.")
                 return
             
             title = anime_data.get('title', {}).get('english') or anime_data.get('title', {}).get('romaji', 'N/A')
             message = (
-                f"🎬 <b>{title}</b>\n\n"
-                f"⭐ <b>Score:</b> {anime_data.get('averageScore', 'N/A')}/100\n"
-                f"📊 <b>Popularity:</b> #{anime_data.get('popularity', 'N/A')}\n"
-                f"🎬 <b>Format:</b> {anime_data.get('format', 'N/A')}\n"
-                f"📺 <b>Episodes:</b> {anime_data.get('episodes', 'N/A')}\n"
-                f"📅 <b>Status:</b> {anime_data.get('status', 'N/A').capitalize()}\n"
-                f"🏷️ <b>Genres:</b> {', '.join(anime_data.get('genres', ['N/A']))}\n\n"
-                f"🔗 <a href='https://anilist.co/anime/{anime_data.get('id')}'>View on AniList</a>"
+                f"<b>{title}</b>\n\n"
+                f"Score: {anime_data.get('averageScore', 'N/A')}/100\n"
+                f"Popularity: #{anime_data.get('popularity', 'N/A')}\n"
+                f"Format: {anime_data.get('format', 'N/A')}\n"
+                f"Episodes: {anime_data.get('episodes', 'N/A')}\n"
+                f"Status: {anime_data.get('status', 'N/A').capitalize()}\n"
+                f"Genres: {', '.join(anime_data.get('genres', ['N/A']))}\n\n"
+                f"<a href='https://anilist.co/anime/{anime_data.get('id')}'>View on AniList</a>"
             )
             
-            await update.message.reply_text(message, parse_mode=ParseMode.HTML, disable_web_page_preview=True)
+            keyboard = [
+                [InlineKeyboardButton("Characters", callback_data=f"chars_{anime_data.get('id')}"),
+                 InlineKeyboardButton("Staff", callback_data=f"staff_{anime_data.get('id')}")],
+                [InlineKeyboardButton("View on AniList", url=f"https://anilist.co/anime/{anime_data.get('id')}")]
+            ]
+            reply_markup = InlineKeyboardMarkup(keyboard)
+            
+            await update.message.reply_text(
+                message, 
+                parse_mode=ParseMode.HTML, 
+                disable_web_page_preview=True,
+                reply_markup=reply_markup
+            )
             
         except Exception as e:
             logger.error(f"Anime error: {e}")
-            await update.message.reply_text("❌ Error fetching anime information.")
+            await update.message.reply_text("Error fetching anime information.")
     
     async def trending_command(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         """Handle /trending command"""
@@ -593,21 +586,21 @@ class AnimeBot:
             results = await anilist_api.get_trending_anime(per_page=10)
             
             if not results:
-                await update.message.reply_text("❌ No trending anime found.")
+                await update.message.reply_text("No trending anime found.")
                 return
             
-            message = "🔥 <b>Trending Anime Now:</b>\n\n"
+            message = "<b>Trending Anime Now:</b>\n\n"
             for i, anime in enumerate(results, 1):
                 title = anime.get('title', {}).get('english') or anime.get('title', {}).get('romaji', 'N/A')
                 score = anime.get('averageScore', 'N/A')
                 message += f"{i}. <b>{title}</b>\n"
-                message += f"   ⭐ {score} | 📈 {anime.get('trending', 'N/A')} trending\n\n"
+                message += f"   Score: {score} | Trending: {anime.get('trending', 'N/A')}\n\n"
             
             await update.message.reply_text(message, parse_mode=ParseMode.HTML)
             
         except Exception as e:
             logger.error(f"Trending error: {e}")
-            await update.message.reply_text("❌ Error fetching trending anime.")
+            await update.message.reply_text("Error fetching trending anime.")
     
     async def schedule_command(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         """Handle /schedule command"""
@@ -616,7 +609,7 @@ class AnimeBot:
         try:
             schedule = await anilist_api.get_airing_schedule()
             
-            message = "📺 <b>Today's Airing Schedule:</b>\n\n"
+            message = "<b>Today's Airing Schedule:</b>\n\n"
             current_time = datetime.now()
             
             for i, anime in enumerate(schedule[:10], 1):
@@ -634,7 +627,7 @@ class AnimeBot:
                     minutes = int((time_diff.total_seconds() % 3600) // 60)
                     
                     message += f"{i}. <b>{title}</b> - Ep {episode}\n"
-                    message += f"   ⏰ {time_str} (in {hours}h {minutes}m)\n\n"
+                    message += f"   Time: {time_str} (in {hours}h {minutes}m)\n\n"
                 else:
                     message += f"{i}. <b>{title}</b> - Ep {episode}\n\n"
             
@@ -645,7 +638,7 @@ class AnimeBot:
             
         except Exception as e:
             logger.error(f"Schedule error: {e}")
-            await update.message.reply_text("❌ Error fetching schedule.")
+            await update.message.reply_text("Error fetching schedule.")
     
     async def topanime_command(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         """Handle /topanime command"""
@@ -654,25 +647,24 @@ class AnimeBot:
         try:
             results = await anilist_api.get_top_anime(page=1, per_page=10)
             
-            message = "🏆 <b>Top Anime:</b>\n\n"
+            message = "<b>Top Anime:</b>\n\n"
             for i, anime in enumerate(results, 1):
                 title = anime.get('title', {}).get('english') or anime.get('title', {}).get('romaji', 'N/A')
                 score = anime.get('averageScore', 'N/A')
                 message += f"{i}. <b>{title}</b>\n"
-                message += f"   ⭐ {score} | 🎬 {anime.get('format', 'N/A')}\n\n"
+                message += f"   Score: {score} | Format: {anime.get('format', 'N/A')}\n\n"
             
             await update.message.reply_text(message, parse_mode=ParseMode.HTML)
             
         except Exception as e:
             logger.error(f"Top anime error: {e}")
-            await update.message.reply_text("❌ Error fetching top anime.")
+            await update.message.reply_text("Error fetching top anime.")
     
     async def user_command(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         """Handle /user command"""
         if not context.args:
             await update.message.reply_text(
-                "Please provide AniList username.\n"
-                "Example: <code>/user username</code>",
+                "Please provide AniList username.\nExample: <code>/user username</code>",
                 parse_mode=ParseMode.HTML
             )
             return
@@ -684,26 +676,26 @@ class AnimeBot:
             user_data = await anilist_api.get_user_profile(username)
             
             if not user_data:
-                await update.message.reply_text("❌ User not found.")
+                await update.message.reply_text("User not found.")
                 return
             
             name = user_data.get('name', 'N/A')
             stats = user_data.get('statistics', {}).get('anime', {})
             
             message = (
-                f"👤 <b>{name}</b>\n\n"
-                f"📊 <b>Anime Statistics:</b>\n"
-                f"• Total Anime: {stats.get('count', 0)}\n"
-                f"• Mean Score: {stats.get('meanScore', 0)}/100\n"
-                f"• Episodes Watched: {stats.get('episodesWatched', 0):,}\n\n"
-                f"🔗 <a href='https://anilist.co/user/{username}'>View Full Profile</a>"
+                f"<b>{name}</b>\n\n"
+                f"<b>Anime Statistics:</b>\n"
+                f"Total Anime: {stats.get('count', 0)}\n"
+                f"Mean Score: {stats.get('meanScore', 0)}/100\n"
+                f"Episodes Watched: {stats.get('episodesWatched', 0):,}\n\n"
+                f"<a href='https://anilist.co/user/{username}'>View Full Profile</a>"
             )
             
             await update.message.reply_text(message, parse_mode=ParseMode.HTML, disable_web_page_preview=True)
             
         except Exception as e:
             logger.error(f"User profile error: {e}")
-            await update.message.reply_text("❌ Error fetching user profile.")
+            await update.message.reply_text("Error fetching user profile.")
     
     async def random_command(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         """Handle /random command"""
@@ -713,25 +705,25 @@ class AnimeBot:
             anime_data = await anilist_api.get_random_anime()
             
             if not anime_data:
-                await update.message.reply_text("❌ Failed to get random anime.")
+                await update.message.reply_text("Failed to get random anime.")
                 return
             
             title = anime_data.get('title', {}).get('english') or anime_data.get('title', {}).get('romaji', 'N/A')
             message = (
-                f"🎲 <b>Random Anime Recommendation:</b>\n\n"
-                f"🎬 <b>{title}</b>\n"
-                f"⭐ <b>Score:</b> {anime_data.get('averageScore', 'N/A')}/100\n"
-                f"📊 <b>Popularity:</b> #{anime_data.get('popularity', 'N/A')}\n"
-                f"📺 <b>Episodes:</b> {anime_data.get('episodes', 'N/A')}\n"
-                f"🏷️ <b>Genres:</b> {', '.join(anime_data.get('genres', ['N/A']))}\n\n"
-                f"🔗 <a href='https://anilist.co/anime/{anime_data.get('id')}'>View on AniList</a>"
+                f"<b>Random Anime Recommendation:</b>\n\n"
+                f"<b>{title}</b>\n"
+                f"Score: {anime_data.get('averageScore', 'N/A')}/100\n"
+                f"Popularity: #{anime_data.get('popularity', 'N/A')}\n"
+                f"Episodes: {anime_data.get('episodes', 'N/A')}\n"
+                f"Genres: {', '.join(anime_data.get('genres', ['N/A']))}\n\n"
+                f"<a href='https://anilist.co/anime/{anime_data.get('id')}'>View on AniList</a>"
             )
             
             await update.message.reply_text(message, parse_mode=ParseMode.HTML, disable_web_page_preview=True)
             
         except Exception as e:
             logger.error(f"Random anime error: {e}")
-            await update.message.reply_text("❌ Error getting random anime.")
+            await update.message.reply_text("Error getting random anime.")
     
     async def quote_command(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         """Handle /quote command"""
@@ -741,7 +733,7 @@ class AnimeBot:
             quote_data = await anilist_api.get_anime_quote()
             
             message = (
-                f"💬 <b>Anime Quote:</b>\n\n"
+                f"<b>Anime Quote:</b>\n\n"
                 f"\"{quote_data.get('quote', 'No quote available.')}\"\n\n"
                 f"— <i>{quote_data.get('character', 'Unknown')}</i>\n"
                 f"<b>{quote_data.get('anime', 'Unknown')}</b>"
@@ -751,7 +743,7 @@ class AnimeBot:
             
         except Exception as e:
             logger.error(f"Quote error: {e}")
-            await update.message.reply_text("❌ Error getting quote.")
+            await update.message.reply_text("Error getting quote.")
     
     # =========== ADMIN COMMANDS ===========
     
@@ -760,40 +752,44 @@ class AnimeBot:
         user = update.effective_user
         
         if user.id not in ADMIN_IDS:
-            await update.message.reply_text("❌ This command is for admins only.")
+            await update.message.reply_text("This command is for admins only.")
             return
         
-        # Get statistics
         total_users = len(redis_client.keys('user:*'))
         total_groups = len(redis_client.smembers('groups'))
         uptime = self.format_time(int((datetime.now() - self.start_time).total_seconds()))
         
         admin_text = (
-            f"🛠️ <b>Admin Panel</b>\n\n"
-            f"📊 <b>Bot Statistics:</b>\n"
-            f"• Users: {total_users}\n"
-            f"• Groups: {total_groups}\n"
-            f"• Uptime: {uptime}\n\n"
-            f"🔧 <b>Quick Commands:</b>\n"
+            f"<b>Admin Panel</b>\n\n"
+            f"<b>Bot Statistics:</b>\n"
+            f"Users: {total_users}\n"
+            f"Groups: {total_groups}\n"
+            f"Uptime: {uptime}\n\n"
+            f"<b>Quick Commands:</b>\n"
             f"• <code>/ping</code> - Check bot status\n"
             f"• <code>/statsbot</code> - Detailed statistics\n"
             f"• <code>/users</code> - List all users\n"
             f"• <code>/groups</code> - List all groups\n"
             f"• <code>/broadcast</code> - Broadcast message\n"
             f"• <code>/logs</code> - View bot logs\n\n"
-            f"⚙️ <b>Maintenance:</b>\n"
+            f"<b>New Admin Commands:</b>\n"
+            f"• <code>/eval</code> - Evaluate code\n"
+            f"• <code>/export</code> - Export data\n"
+            f"• <code>/import</code> - Import data\n"
+            f"• <code>/shell</code> - Run shell command\n\n"
+            f"<b>Maintenance:</b>\n"
             f"• <code>/maintenance on/off</code>\n"
-            f"• Current: {'🔴 ON' if self.maintenance_mode else '🟢 OFF'}\n\n"
-            f"📚 <code>/help admin</code> for full admin commands"
+            f"Current: {'ON' if self.maintenance_mode else 'OFF'}\n\n"
+            f"<code>/help admin</code> for full admin commands"
         )
         
         keyboard = [
-            [InlineKeyboardButton("📊 Stats", callback_data="admin_stats"),
-             InlineKeyboardButton("👥 Users", callback_data="admin_users")],
-            [InlineKeyboardButton("👥 Groups", callback_data="admin_groups"),
-             InlineKeyboardButton("📢 Broadcast", callback_data="admin_broadcast")],
-            [InlineKeyboardButton("⚙️ Settings", callback_data="admin_settings"),
-             InlineKeyboardButton("📜 Logs", callback_data="admin_logs")]
+            [InlineKeyboardButton("Stats", callback_data="admin_stats"),
+             InlineKeyboardButton("Users", callback_data="admin_users")],
+            [InlineKeyboardButton("Groups", callback_data="admin_groups"),
+             InlineKeyboardButton("Broadcast", callback_data="admin_broadcast")],
+            [InlineKeyboardButton("Settings", callback_data="admin_settings"),
+             InlineKeyboardButton("Logs", callback_data="admin_logs")]
         ]
         
         reply_markup = InlineKeyboardMarkup(keyboard)
@@ -804,34 +800,33 @@ class AnimeBot:
         user = update.effective_user
         
         if user.id not in ADMIN_IDS:
-            await update.message.reply_text("❌ This command is for admins only.")
+            await update.message.reply_text("This command is for admins only.")
             return
         
         import time
         start = time.time()
         
-        # Check services
-        redis_status = "✅ Connected" if redis_client.ping() else "❌ Disconnected"
+        redis_status = "Connected" if redis_client.ping() else "Disconnected"
         
         try:
             await anilist_api.get_trending_anime(per_page=1)
-            api_status = "✅ Working"
+            api_status = "Working"
         except:
-            api_status = "❌ Failed"
+            api_status = "Failed"
         
         end = time.time()
         latency = round((end - start) * 1000, 2)
         
         ping_text = (
-            f"🏓 <b>Pong!</b>\n\n"
-            f"⏱️ <b>Latency:</b> {latency}ms\n"
-            f"🕐 <b>Uptime:</b> {self.format_time(int((datetime.now() - self.start_time).total_seconds()))}\n\n"
-            f"🔧 <b>Services:</b>\n"
-            f"• Redis: {redis_status}\n"
-            f"• AniList API: {api_status}\n\n"
-            f"📊 <b>Usage:</b>\n"
-            f"• Users: {len(redis_client.keys('user:*'))}\n"
-            f"• Groups: {len(redis_client.smembers('groups'))}"
+            f"<b>Pong!</b>\n\n"
+            f"Latency: {latency}ms\n"
+            f"Uptime: {self.format_time(int((datetime.now() - self.start_time).total_seconds()))}\n\n"
+            f"<b>Services:</b>\n"
+            f"Redis: {redis_status}\n"
+            f"AniList API: {api_status}\n\n"
+            f"<b>Usage:</b>\n"
+            f"Users: {len(redis_client.keys('user:*'))}\n"
+            f"Groups: {len(redis_client.smembers('groups'))}"
         )
         
         await update.message.reply_text(ping_text, parse_mode=ParseMode.HTML)
@@ -841,25 +836,25 @@ class AnimeBot:
         user = update.effective_user
         
         if user.id not in ADMIN_IDS:
-            await update.message.reply_text("❌ This command is for admins only.")
+            await update.message.reply_text("This command is for admins only.")
             return
         
         groups = redis_client.smembers('groups')
         
         if not groups:
-            await update.message.reply_text("🤖 Bot is not in any groups yet.")
+            await update.message.reply_text("Bot is not in any groups yet.")
             return
         
-        message = "👥 <b>Groups Bot is In:</b>\n\n"
+        message = "<b>Groups Bot is In:</b>\n\n"
         for i, group_id in enumerate(list(groups)[:20], 1):
             group_data = redis_client.hgetall(f"group:{group_id}") or {}
             title = group_data.get('title', 'Unknown Group')
             message += f"{i}. <b>{title}</b>\n"
-            message += f"   🆔 <code>{group_id}</code>\n"
-            message += f"   ⏰ {group_data.get('last_active', 'Never')}\n\n"
+            message += f"   ID: <code>{group_id}</code>\n"
+            message += f"   Last active: {group_data.get('last_active', 'Never')}\n\n"
         
         if len(groups) > 20:
-            message += f"\n📋 ... and {len(groups) - 20} more groups"
+            message += f"\n... and {len(groups) - 20} more groups"
         
         await update.message.reply_text(message, parse_mode=ParseMode.HTML)
     
@@ -868,16 +863,16 @@ class AnimeBot:
         user = update.effective_user
         
         if user.id not in ADMIN_IDS:
-            await update.message.reply_text("❌ This command is for admins only.")
+            await update.message.reply_text("This command is for admins only.")
             return
         
         user_keys = redis_client.keys('user:*')
         
         if not user_keys:
-            await update.message.reply_text("❌ No users found.")
+            await update.message.reply_text("No users found.")
             return
         
-        message = "👤 <b>Bot Users:</b>\n\n"
+        message = "<b>Bot Users:</b>\n\n"
         for i, key in enumerate(user_keys[:20], 1):
             user_data = redis_client.hgetall(key) or {}
             user_id = key.split(':')[-1]
@@ -887,10 +882,10 @@ class AnimeBot:
             message += f"{i}. <code>{user_id}</code> - {first_name}"
             if username:
                 message += f" (@{username})"
-            message += f"\n   📊 Commands: {user_data.get('command_count', '0')}\n\n"
+            message += f"\n   Commands: {user_data.get('command_count', '0')}\n\n"
         
         if len(user_keys) > 20:
-            message += f"\n📋 ... and {len(user_keys) - 20} more users"
+            message += f"\n... and {len(user_keys) - 20} more users"
         
         await update.message.reply_text(message, parse_mode=ParseMode.HTML)
     
@@ -899,7 +894,7 @@ class AnimeBot:
         user = update.effective_user
         
         if user.id not in ADMIN_IDS:
-            await update.message.reply_text("❌ This command is for admins only.")
+            await update.message.reply_text("This command is for admins only.")
             return
         
         total_users = len(redis_client.keys('user:*'))
@@ -907,14 +902,14 @@ class AnimeBot:
         uptime = self.format_time(int((datetime.now() - self.start_time).total_seconds()))
         
         stats_text = (
-            f"📊 <b>Bot Statistics</b>\n\n"
-            f"👥 <b>Users:</b> {total_users}\n"
-            f"👥 <b>Groups:</b> {total_groups}\n\n"
-            f"⏱️ <b>Uptime:</b> {uptime}\n\n"
-            f"🔧 <b>Services:</b>\n"
-            f"• Redis: {'✅ Connected' if redis_client.ping() else '❌ Disconnected'}\n"
-            f"• AniList API: ✅ Working\n\n"
-            f"⚙️ <b>Maintenance Mode:</b> {'🔴 ON' if self.maintenance_mode else '🟢 OFF'}"
+            f"<b>Bot Statistics</b>\n\n"
+            f"Users: {total_users}\n"
+            f"Groups: {total_groups}\n\n"
+            f"Uptime: {uptime}\n\n"
+            f"<b>Services:</b>\n"
+            f"Redis: {'Connected' if redis_client.ping() else 'Disconnected'}\n"
+            f"AniList API: Working\n\n"
+            f"<b>Maintenance Mode:</b> {'ON' if self.maintenance_mode else 'OFF'}"
         )
         
         await update.message.reply_text(stats_text, parse_mode=ParseMode.HTML)
@@ -924,13 +919,12 @@ class AnimeBot:
         user = update.effective_user
         
         if user.id not in ADMIN_IDS:
-            await update.message.reply_text("❌ This command is for admins only.")
+            await update.message.reply_text("This command is for admins only.")
             return
         
         if not context.args:
             await update.message.reply_text(
-                "Please provide user ID.\n"
-                "Example: <code>/pro 1234567890</code>",
+                "Please provide user ID.\nExample: <code>/pro 1234567890</code>",
                 parse_mode=ParseMode.HTML
             )
             return
@@ -939,36 +933,34 @@ class AnimeBot:
             target_id = int(context.args[0])
             
             if target_id in ADMIN_IDS:
-                await update.message.reply_text("⚠️ User is already an admin.")
+                await update.message.reply_text("User is already an admin.")
                 return
             
-            # Update user data
             user_key = f"user:{target_id}"
             if not redis_client.exists(user_key):
-                await update.message.reply_text("❌ User not found in database.")
+                await update.message.reply_text("User not found in database.")
                 return
             
             redis_client.hset(user_key, 'is_admin', 'true')
             ADMIN_IDS.append(target_id)
             
-            await update.message.reply_text(f"✅ User <code>{target_id}</code> has been promoted to admin.")
-            await self.log_to_channel(f"👑 User {target_id} promoted by {user.id}")
+            await update.message.reply_text(f"User <code>{target_id}</code> has been promoted to admin.")
+            await self.log_to_channel(f"User {target_id} promoted by {user.id}")
             
         except ValueError:
-            await update.message.reply_text("❌ Invalid user ID.")
+            await update.message.reply_text("Invalid user ID.")
     
     async def broadcast_command(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
-        """Handle /broadcast command"""
+        """Handle /broadcast command (natural message)"""
         user = update.effective_user
         
         if user.id not in ADMIN_IDS:
-            await update.message.reply_text("❌ This command is for admins only.")
+            await update.message.reply_text("This command is for admins only.")
             return
         
         if not context.args:
             await update.message.reply_text(
-                "Please provide a message to broadcast.\n"
-                "Example: <code>/broadcast Hello everyone!</code>",
+                "Please provide a message to broadcast.\nExample: <code>/broadcast Hello everyone!</code>",
                 parse_mode=ParseMode.HTML
             )
             return
@@ -977,7 +969,7 @@ class AnimeBot:
         total_users = len(redis_client.keys('user:*'))
         
         confirm_text = (
-            f"📢 <b>Broadcast Confirmation</b>\n\n"
+            f"<b>Broadcast Confirmation</b>\n\n"
             f"<b>Message:</b>\n{message}\n\n"
             f"<b>Target:</b> All users\n"
             f"<b>Total users:</b> {total_users}\n\n"
@@ -985,12 +977,11 @@ class AnimeBot:
         )
         
         keyboard = [
-            [InlineKeyboardButton("✅ Yes, Broadcast", callback_data=f"broadcast_confirm_{user.id}")],
-            [InlineKeyboardButton("❌ Cancel", callback_data="broadcast_cancel")]
+            [InlineKeyboardButton("Yes, Broadcast", callback_data=f"broadcast_confirm_{user.id}")],
+            [InlineKeyboardButton("Cancel", callback_data="broadcast_cancel")]
         ]
         reply_markup = InlineKeyboardMarkup(keyboard)
         
-        # Store message temporarily
         redis_client.setex(f"broadcast:{user.id}", 300, message)
         
         await update.message.reply_text(confirm_text, parse_mode=ParseMode.HTML, reply_markup=reply_markup)
@@ -1000,7 +991,7 @@ class AnimeBot:
         user = update.effective_user
         
         if user.id not in ADMIN_IDS:
-            await update.message.reply_text("❌ This command is for admins only.")
+            await update.message.reply_text("This command is for admins only.")
             return
         
         try:
@@ -1008,27 +999,26 @@ class AnimeBot:
                 log_lines = f.readlines()
             
             last_logs = log_lines[-50:] if log_lines else ["No logs found"]
-            logs_text = f"📜 <b>Last 50 Log Lines:</b>\n\n<code>"
-            logs_text += "".join(last_logs)[-4000:]  # Limit to 4000 chars
+            logs_text = f"<b>Last 50 Log Lines:</b>\n\n<code>"
+            logs_text += "".join(last_logs)[-4000:]
             logs_text += "</code>"
             
             await update.message.reply_text(logs_text, parse_mode=ParseMode.HTML)
             
         except FileNotFoundError:
-            await update.message.reply_text("❌ Log file not found.")
+            await update.message.reply_text("Log file not found.")
     
     async def maintenance_command(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         """Handle /maintenance command"""
         user = update.effective_user
         
         if user.id not in ADMIN_IDS:
-            await update.message.reply_text("❌ This command is for admins only.")
+            await update.message.reply_text("This command is for admins only.")
             return
         
         if not context.args:
             await update.message.reply_text(
-                "Please specify 'on' or 'off'.\n"
-                "Example: <code>/maintenance on</code>",
+                "Please specify 'on' or 'off'.\nExample: <code>/maintenance on</code>",
                 parse_mode=ParseMode.HTML
             )
             return
@@ -1037,14 +1027,163 @@ class AnimeBot:
         
         if mode == 'on':
             self.maintenance_mode = True
-            await update.message.reply_text("🔴 <b>Maintenance mode enabled.</b>\nThe bot will only respond to admins.")
-            await self.log_to_channel(f"🔧 Maintenance enabled by {user.id}")
+            await update.message.reply_text("Maintenance mode enabled.\nThe bot will only respond to admins.")
+            await self.log_to_channel(f"Maintenance enabled by {user.id}")
         elif mode == 'off':
             self.maintenance_mode = False
-            await update.message.reply_text("🟢 <b>Maintenance mode disabled.</b>\nThe bot is now accessible to everyone.")
-            await self.log_to_channel(f"🔧 Maintenance disabled by {user.id}")
+            await update.message.reply_text("Maintenance mode disabled.\nThe bot is now accessible to everyone.")
+            await self.log_to_channel(f"Maintenance disabled by {user.id}")
         else:
-            await update.message.reply_text("❌ Invalid mode. Use 'on' or 'off'.")
+            await update.message.reply_text("Invalid mode. Use 'on' or 'off'.")
+    
+    # =========== NEW ADMIN COMMANDS ===========
+    
+    async def eval_command(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        """Handle /eval command (evaluate Python code)"""
+        user = update.effective_user
+        
+        if user.id not in ADMIN_IDS:
+            await update.message.reply_text("This command is for admins only.")
+            return
+        
+        if not context.args:
+            await update.message.reply_text(
+                "Please provide Python code to evaluate.\nExample: <code>/eval 2+2</code>",
+                parse_mode=ParseMode.HTML
+            )
+            return
+        
+        code = " ".join(context.args)
+        
+        try:
+            # Safe evaluation with limited globals
+            allowed_globals = {
+                '__builtins__': {
+                    'abs': abs, 'all': all, 'any': any, 'bool': bool,
+                    'chr': chr, 'dict': dict, 'float': float, 'int': int,
+                    'len': len, 'list': list, 'max': max, 'min': min,
+                    'ord': ord, 'range': range, 'round': round, 'str': str,
+                    'sum': sum, 'tuple': tuple, 'zip': zip
+                },
+                'datetime': datetime,
+                'time': time,
+                'redis_client': redis_client,
+                'user_id': user.id
+            }
+            
+            result = eval(code, {"__builtins__": {}}, allowed_globals)
+            
+            await update.message.reply_text(
+                f"<b>Code:</b>\n<code>{code}</code>\n\n"
+                f"<b>Result:</b>\n<code>{result}</code>",
+                parse_mode=ParseMode.HTML
+            )
+            
+        except Exception as e:
+            await update.message.reply_text(f"Error: {str(e)}")
+    
+    async def export_command(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        """Handle /export command (export user data)"""
+        user = update.effective_user
+        
+        if user.id not in ADMIN_IDS:
+            await update.message.reply_text("This command is for admins only.")
+            return
+        
+        await update.message.reply_chat_action("typing")
+        
+        try:
+            user_keys = redis_client.keys('user:*')
+            export_data = []
+            
+            for key in user_keys:
+                user_data = redis_client.hgetall(key)
+                export_data.append(user_data)
+            
+            # Create JSON export
+            timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+            filename = f"export_{timestamp}.json"
+            
+            import json
+            export_json = json.dumps(export_data, indent=2)
+            
+            # Save to file
+            with open(filename, 'w') as f:
+                f.write(export_json)
+            
+            await update.message.reply_text(
+                f"Exported {len(export_data)} users to <code>{filename}</code>\n\n"
+                f"<code>{export_json[:1000]}...</code>",
+                parse_mode=ParseMode.HTML
+            )
+            
+            await self.log_to_channel(f"Data exported by {user.id}: {len(export_data)} users")
+            
+        except Exception as e:
+            await update.message.reply_text(f"Export error: {str(e)}")
+    
+    async def import_command(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        """Handle /import command (import user data)"""
+        user = update.effective_user
+        
+        if user.id not in ADMIN_IDS:
+            await update.message.reply_text("This command is for admins only.")
+            return
+        
+        if not update.message.document:
+            await update.message.reply_text(
+                "Please send a JSON file to import.\n"
+                "Use /export to see the format.",
+                parse_mode=ParseMode.HTML
+            )
+            return
+        
+        await update.message.reply_text("Import feature coming soon...")
+    
+    async def shell_command(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        """Handle /shell command (run shell command)"""
+        user = update.effective_user
+        
+        if user.id not in ADMIN_IDS:
+            await update.message.reply_text("This command is for admins only.")
+            return
+        
+        if not context.args:
+            await update.message.reply_text(
+                "Please provide shell command.\nExample: <code>/shell ls -la</code>",
+                parse_mode=ParseMode.HTML
+            )
+            return
+        
+        command = " ".join(context.args)
+        
+        # Only allow safe commands
+        allowed_commands = ['ls', 'pwd', 'whoami', 'date', 'uptime', 'free', 'df', 'ps']
+        cmd_base = command.split()[0]
+        
+        if cmd_base not in allowed_commands:
+            await update.message.reply_text(
+                f"Command not allowed. Allowed commands: {', '.join(allowed_commands)}"
+            )
+            return
+        
+        try:
+            import subprocess
+            result = subprocess.run(command, shell=True, capture_output=True, text=True, timeout=10)
+            
+            output = f"<b>Command:</b> <code>{command}</code>\n\n"
+            if result.stdout:
+                output += f"<b>Output:</b>\n<code>{result.stdout[:1000]}</code>\n\n"
+            if result.stderr:
+                output += f"<b>Errors:</b>\n<code>{result.stderr[:1000]}</code>\n\n"
+            output += f"<b>Exit code:</b> {result.returncode}"
+            
+            await update.message.reply_text(output, parse_mode=ParseMode.HTML)
+            
+        except subprocess.TimeoutExpired:
+            await update.message.reply_text("Command timed out after 10 seconds.")
+        except Exception as e:
+            await update.message.reply_text(f"Error: {str(e)}")
     
     # =========== CALLBACK HANDLERS ===========
     
@@ -1062,20 +1201,19 @@ class AnimeBot:
                 await self.trending_command(update, context)
             elif data == "stats_me":
                 await query.edit_message_text(
-                    "📊 Use <code>/user your_username</code> to see your AniList stats.",
+                    "Use <code>/user your_username</code> to see your AniList stats.",
                     parse_mode=ParseMode.HTML
                 )
             elif data == "settings":
                 await query.edit_message_text(
-                    "⚙️ Settings menu coming soon!\n"
-                    "For now, contact admin for configuration.",
+                    "Settings menu coming soon!\nFor now, contact admin for configuration.",
                     parse_mode=ParseMode.HTML
                 )
             elif data.startswith("broadcast_confirm_"):
                 admin_id = int(data.split("_")[2])
                 await self.execute_broadcast(query, admin_id)
             elif data == "broadcast_cancel":
-                await query.edit_message_text("❌ Broadcast cancelled.")
+                await query.edit_message_text("Broadcast cancelled.")
             elif data == "admin_stats":
                 await self.statsbot_command(update, context)
             elif data == "admin_users":
@@ -1084,34 +1222,87 @@ class AnimeBot:
                 await self.groups_command(update, context)
             elif data == "admin_broadcast":
                 await query.edit_message_text(
-                    "📢 Use <code>/broadcast message</code> to send a broadcast.",
+                    "Use <code>/broadcast message</code> to send a broadcast.",
                     parse_mode=ParseMode.HTML
                 )
             elif data == "admin_logs":
                 await self.logs_command(update, context)
+            elif data == "admin_settings":
+                await query.edit_message_text(
+                    "Admin settings:\n"
+                    "• <code>/maintenance on/off</code>\n"
+                    "• <code>/ping</code>\n"
+                    "• <code>/statsbot</code>",
+                    parse_mode=ParseMode.HTML
+                )
+            elif data.startswith("anime_"):
+                anime_id = int(data.split("_")[1])
+                await self.handle_anime_callback(query, anime_id)
+            elif data.startswith("chars_"):
+                anime_id = int(data.split("_")[1])
+                await query.edit_message_text(
+                    f"Characters for anime ID {anime_id}\n"
+                    f"Full characters list coming soon...",
+                    parse_mode=ParseMode.HTML
+                )
+            elif data.startswith("staff_"):
+                anime_id = int(data.split("_")[1])
+                await query.edit_message_text(
+                    f"Staff for anime ID {anime_id}\n"
+                    f"Full staff list coming soon...",
+                    parse_mode=ParseMode.HTML
+                )
             else:
-                await query.edit_message_text("❌ Unknown button action.")
+                await query.edit_message_text("Unknown button action.")
         except Exception as e:
             logger.error(f"Button callback error: {e}")
-            await query.edit_message_text("❌ Error processing button action.")
+            await query.edit_message_text("Error processing button action.")
+    
+    async def handle_anime_callback(self, query, anime_id):
+        """Handle anime callback"""
+        await query.message.reply_chat_action("typing")
+        
+        try:
+            anime_data = await anilist_api.get_anime(anime_id)
+            
+            if anime_data:
+                title = anime_data.get('title', {}).get('english') or anime_data.get('title', {}).get('romaji', 'N/A')
+                message = (
+                    f"<b>{title}</b>\n\n"
+                    f"Score: {anime_data.get('averageScore', 'N/A')}/100\n"
+                    f"Popularity: #{anime_data.get('popularity', 'N/A')}\n"
+                    f"Format: {anime_data.get('format', 'N/A')}\n"
+                    f"Episodes: {anime_data.get('episodes', 'N/A')}\n"
+                    f"Genres: {', '.join(anime_data.get('genres', ['N/A']))}\n\n"
+                    f"<a href='https://anilist.co/anime/{anime_id}'>View on AniList</a>"
+                )
+                
+                await query.message.reply_text(message, parse_mode=ParseMode.HTML, disable_web_page_preview=True)
+            else:
+                await query.answer("Failed to fetch anime data.", show_alert=True)
+                
+        except Exception as e:
+            logger.error(f"Callback error: {e}")
+            await query.answer("Error fetching anime.", show_alert=True)
     
     async def execute_broadcast(self, query, admin_id):
-        """Execute broadcast to all users"""
-        await query.edit_message_text("📢 Broadcasting started...")
+        """Execute broadcast to all users (natural message)"""
+        await query.edit_message_text("Broadcasting started...")
         
         message = redis_client.get(f"broadcast:{admin_id}")
         if not message:
-            await query.edit_message_text("❌ Broadcast message expired.")
+            await query.edit_message_text("Broadcast message expired.")
             return
         
         user_keys = redis_client.keys('user:*')
         success = 0
         failed = 0
         
+        # Natural broadcast message without emoji
         broadcast_text = (
-            f"📢 <b>Announcement</b>\n\n"
+            f"Announcement\n\n"
             f"{message}\n\n"
-            f"<i>From AnimeKuun Bot Admin</i>"
+            f"From AnimeKuun Bot Admin"
         )
         
         for key in user_keys:
@@ -1124,11 +1315,10 @@ class AnimeBot:
             try:
                 await self.app.bot.send_message(
                     chat_id=user_id,
-                    text=broadcast_text,
-                    parse_mode=ParseMode.HTML
+                    text=broadcast_text
                 )
                 success += 1
-                await asyncio.sleep(0.05)  # Rate limiting
+                await asyncio.sleep(0.05)
             except Exception as e:
                 failed += 1
                 logger.error(f"Broadcast failed for {user_id}: {e}")
@@ -1136,15 +1326,15 @@ class AnimeBot:
         redis_client.delete(f"broadcast:{admin_id}")
         
         result_text = (
-            f"✅ <b>Broadcast Complete!</b>\n\n"
-            f"📊 <b>Results:</b>\n"
-            f"• ✅ Success: {success}\n"
-            f"• ❌ Failed: {failed}\n"
-            f"• 📋 Total: {success + failed}"
+            f"<b>Broadcast Complete!</b>\n\n"
+            f"<b>Results:</b>\n"
+            f"Success: {success}\n"
+            f"Failed: {failed}\n"
+            f"Total: {success + failed}"
         )
         
         await query.edit_message_text(result_text, parse_mode=ParseMode.HTML)
-        await self.log_to_channel(f"📢 Broadcast by {admin_id}: {success}成功, {failed}失败")
+        await self.log_to_channel(f"Broadcast by {admin_id}: {success} success, {failed} failed")
     
     # =========== MESSAGE HANDLERS ===========
     
@@ -1152,7 +1342,6 @@ class AnimeBot:
         """Handle messages in groups"""
         chat = update.effective_chat
         
-        # Update group info
         group_key = f"group:{chat.id}"
         group_data = redis_client.hgetall(group_key) or {}
         if not group_data:
@@ -1168,10 +1357,9 @@ class AnimeBot:
             group_data['last_active'] = datetime.now().isoformat()
             redis_client.hset(group_key, 'last_active', group_data['last_active'])
         
-        # Check if bot is mentioned
         if context.bot.username and f"@{context.bot.username}" in update.message.text:
             response = (
-                "🤖 Hi! I'm AnimeKuun Bot!\n"
+                "Hi! I'm AnimeKuun Bot!\n"
                 "Use /help to see all commands.\n"
                 "Try: /search, /trending, /schedule"
             )
@@ -1184,7 +1372,7 @@ class AnimeBot:
         for member in update.message.new_chat_members:
             if member.id == context.bot.id:
                 welcome_text = (
-                    "🎌 Thanks for adding <b>AnimeKuun Bot</b>!\n\n"
+                    "Thanks for adding AnimeKuun Bot!\n\n"
                     "I can help with:\n"
                     "• Searching anime/manga\n"
                     "• Getting airing schedules\n"
@@ -1198,7 +1386,7 @@ class AnimeBot:
                 )
                 
                 await update.message.reply_text(welcome_text, parse_mode=ParseMode.HTML)
-                await self.log_to_channel(f"🤖 Bot added to group: {chat.id} ({chat.title})")
+                await self.log_to_channel(f"Bot added to group: {chat.id} ({chat.title})")
     
     # =========== ERROR HANDLER ===========
     
@@ -1209,7 +1397,7 @@ class AnimeBot:
         try:
             if update and update.effective_chat:
                 error_msg = (
-                    "❌ An error occurred. Please try again.\n"
+                    "An error occurred. Please try again.\n"
                     "If the problem persists, contact the admin."
                 )
                 await update.effective_chat.send_message(error_msg)
@@ -1245,6 +1433,12 @@ class AnimeBot:
         self.app.add_handler(CommandHandler("broadcast", self.broadcast_command))
         self.app.add_handler(CommandHandler("logs", self.logs_command))
         self.app.add_handler(CommandHandler("maintenance", self.maintenance_command))
+        
+        # New admin commands
+        self.app.add_handler(CommandHandler("eval", self.eval_command))
+        self.app.add_handler(CommandHandler("export", self.export_command))
+        self.app.add_handler(CommandHandler("import", self.import_command))
+        self.app.add_handler(CommandHandler("shell", self.shell_command))
         
         # Message handlers
         self.app.add_handler(MessageHandler(
@@ -1282,15 +1476,26 @@ class AnimeBot:
         
         try:
             await self.app.bot.set_my_commands(commands)
-            logger.info("✅ Bot commands set successfully")
+            logger.info("Bot commands set successfully")
         except Exception as e:
-            logger.error(f"❌ Failed to set commands: {e}")
+            logger.error(f"Failed to set commands: {e}")
+    
+    async def setup_webhook(self):
+        """Setup webhook for Railway"""
+        if WEBHOOK_URL:
+            webhook_url = f"{WEBHOOK_URL}/{BOT_TOKEN}"
+            await self.app.bot.set_webhook(url=webhook_url)
+            logger.info(f"Webhook set to: {webhook_url}")
+        else:
+            logger.info("Using polling mode")
     
     async def run(self):
         """Run the bot"""
-        logger.info("🚀 Starting AnimeKuun Bot...")
+        logger.info("Starting AnimeKuun Bot...")
         logger.info(f"Bot Token: {BOT_TOKEN[:10]}...")
         logger.info(f"Admin IDs: {ADMIN_IDS}")
+        logger.info(f"Webhook URL: {WEBHOOK_URL}")
+        logger.info(f"Port: {PORT}")
         
         # Create application
         self.app = Application.builder().token(BOT_TOKEN).build()
@@ -1302,23 +1507,44 @@ class AnimeBot:
         self.app.post_init = self.set_bot_commands
         
         # Log startup
-        await self.log_to_channel("🤖 Bot started successfully!")
-        logger.info("✅ Bot initialized, starting polling...")
+        await self.log_to_channel("Bot started successfully!")
+        logger.info("Bot initialized")
         
-        # Start polling
-        await self.app.initialize()
-        await self.app.start()
-        await self.app.updater.start_polling(allowed_updates=Update.ALL_TYPES)
-        
-        logger.info("✅ Bot is now running and polling for updates")
-        print("\n" + "="*50)
-        print("🤖 AnimeKuun Bot is now running!")
-        print(f"👑 Admin ID: {ADMIN_IDS[0] if ADMIN_IDS else 'None'}")
-        print(f"⏰ Started at: {self.start_time}")
-        print("="*50 + "\n")
-        
-        # Keep running
-        await self.app.updater.idle()
+        if self.is_webhook:
+            # Webhook mode for Railway
+            await self.app.initialize()
+            await self.setup_webhook()
+            
+            # Start webhook server
+            from telegram.ext._application import Application as App
+            await self.app.start()
+            
+            # Keep the application running
+            logger.info("Bot is running with webhook")
+            await self.app.updater.start_webhook(
+                listen="0.0.0.0",
+                port=PORT,
+                url_path=BOT_TOKEN,
+                webhook_url=f"{WEBHOOK_URL}/{BOT_TOKEN}"
+            )
+            
+            # Keep running
+            await self.app.updater.idle()
+        else:
+            # Polling mode for local testing
+            await self.app.initialize()
+            await self.app.start()
+            await self.app.updater.start_polling(allowed_updates=Update.ALL_TYPES)
+            
+            logger.info("Bot is now running and polling for updates")
+            print("\n" + "="*50)
+            print("AnimeKuun Bot is now running!")
+            print(f"Admin ID: {ADMIN_IDS[0] if ADMIN_IDS else 'None'}")
+            print(f"Started at: {self.start_time}")
+            print("="*50 + "\n")
+            
+            # Keep running
+            await self.app.updater.idle()
         
         # Cleanup
         await anilist_api.close()
@@ -1332,10 +1558,10 @@ def main():
         asyncio.run(bot.run())
     except KeyboardInterrupt:
         logger.info("Bot stopped by user (KeyboardInterrupt)")
-        print("\n👋 Bot stopped by user")
+        print("\nBot stopped by user")
     except Exception as e:
         logger.error(f"Bot crashed: {e}")
-        print(f"💥 Bot crashed: {e}")
+        print(f"Bot crashed: {e}")
         traceback.print_exc()
 
 if __name__ == "__main__":
