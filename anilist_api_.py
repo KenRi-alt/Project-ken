@@ -1,3 +1,9 @@
+#!/usr/bin/env python3
+"""
+AniList API Wrapper for AnimeKuun Bot
+Complete API implementation with image generation
+"""
+
 import aiohttp
 import asyncio
 import json
@@ -7,12 +13,20 @@ import hashlib
 from datetime import datetime, timedelta
 from typing import Dict, List, Optional, Any
 import os
-import redis
-from PIL import Image, ImageDraw, ImageFont, ImageFilter, ImageEnhance
+import re
 from io import BytesIO
-import requests
-import textwrap
 
+# Image generation imports
+try:
+    from PIL import Image, ImageDraw, ImageFont, ImageFilter, ImageEnhance
+    HAS_PILLOW = True
+except ImportError:
+    HAS_PILLOW = False
+    print("⚠️ Pillow not installed, image generation disabled")
+
+import requests
+
+# =========== ANILIST API CLASS ===========
 class AniListAPI:
     """Complete AniList API wrapper with caching"""
     
@@ -21,31 +35,51 @@ class AniListAPI:
         self.redis = redis_client
         self.session = None
         self.cache_ttl = 3600  # 1 hour cache
-        self.rate_limit = 30  # requests per minute
+        self.rate_limit = 90  # requests per minute (AniList limit)
+        self.last_request = 0
         
+        # API statistics
+        self.request_count = 0
+        self.error_count = 0
+        
+        logger.info("✅ AniListAPI initialized")
+    
     async def _get_session(self):
         """Get or create aiohttp session"""
         if self.session is None or self.session.closed:
-            self.session = aiohttp.ClientSession()
+            timeout = aiohttp.ClientTimeout(total=30)
+            self.session = aiohttp.ClientSession(timeout=timeout)
         return self.session
     
-    async def _make_request(self, query: str, variables: Dict = None) -> Dict:
+    async def _rate_limit(self):
+        """Implement rate limiting"""
+        now = time.time()
+        time_since_last = now - self.last_request
+        min_interval = 60.0 / self.rate_limit
+        
+        if time_since_last < min_interval:
+            await asyncio.sleep(min_interval - time_since_last)
+        
+        self.last_request = time.time()
+    
+    async def _make_request(self, query: str, variables: Dict = None, cache_key: str = None) -> Dict:
         """Make GraphQL request with caching and rate limiting"""
-        # Create cache key
-        cache_str = query + json.dumps(variables or {}, sort_keys=True)
-        cache_key = f"graphql:{hashlib.md5(cache_str.encode()).hexdigest()}"
+        # Rate limiting
+        await self._rate_limit()
+        
+        # Generate cache key if not provided
+        if not cache_key and variables:
+            cache_str = query + json.dumps(variables, sort_keys=True)
+            cache_key = f"anilist:{hashlib.md5(cache_str.encode()).hexdigest()}"
         
         # Check cache
-        cached = self.redis.get(cache_key)
-        if cached:
-            return json.loads(cached)
-        
-        # Rate limiting
-        rate_key = "rate_limit"
-        current = int(self.redis.get(rate_key) or 0)
-        if current >= self.rate_limit:
-            await asyncio.sleep(60)
-            self.redis.setex(rate_key, 60, "0")
+        if cache_key:
+            cached = self.redis.get(cache_key)
+            if cached:
+                try:
+                    return json.loads(cached)
+                except:
+                    pass
         
         session = await self._get_session()
         
@@ -53,29 +87,38 @@ class AniListAPI:
             async with session.post(
                 self.base_url,
                 json={"query": query, "variables": variables or {}},
-                headers={"Content-Type": "application/json"}
+                headers={
+                    "Content-Type": "application/json",
+                    "Accept": "application/json",
+                    "User-Agent": "AnimeKuunBot/1.0"
+                }
             ) as response:
+                self.request_count += 1
+                
+                if response.status != 200:
+                    self.error_count += 1
+                    error_text = await response.text()
+                    raise Exception(f"HTTP {response.status}: {error_text}")
+                
                 result = await response.json()
                 
                 if "errors" in result:
+                    self.error_count += 1
                     error_msg = result["errors"][0].get("message", "Unknown error")
                     raise Exception(f"AniList API Error: {error_msg}")
                 
                 # Cache successful response
-                if "data" in result:
+                if cache_key and "data" in result:
                     self.redis.setex(cache_key, self.cache_ttl, json.dumps(result))
-                
-                # Update rate limit
-                self.redis.incr(rate_key)
-                self.redis.setex(rate_key, 60, self.redis.get(rate_key))
-                
-                # Update API call stats
-                self.redis.incr("stats:anilist_calls")
                 
                 return result.get("data", {})
                 
-        except Exception as e:
-            raise Exception(f"Request failed: {e}")
+        except aiohttp.ClientError as e:
+            self.error_count += 1
+            raise Exception(f"Network error: {e}")
+        except asyncio.TimeoutError:
+            self.error_count += 1
+            raise Exception("Request timeout")
     
     # =========== ANIME QUERIES ===========
     
@@ -159,8 +202,12 @@ class AniListAPI:
             "perPage": per_page
         }
         
-        result = await self._make_request(graphql_query, variables)
-        return result.get("Page", {}).get("media", [])
+        try:
+            result = await self._make_request(graphql_query, variables)
+            return result.get("Page", {}).get("media", [])
+        except Exception as e:
+            print(f"Search error: {e}")
+            return []
     
     async def get_anime(self, anime_id: int) -> Dict:
         """Get detailed anime information"""
@@ -348,8 +395,14 @@ class AniListAPI:
         """
         
         variables = {"id": anime_id}
-        result = await self._make_request(graphql_query, variables)
-        return result.get("Media", {})
+        cache_key = f"anime:{anime_id}"
+        
+        try:
+            result = await self._make_request(graphql_query, variables, cache_key)
+            return result.get("Media", {})
+        except Exception as e:
+            print(f"Get anime error: {e}")
+            return {}
     
     async def get_trending_anime(self, per_page: int = 15) -> List[Dict]:
         """Get trending anime"""
@@ -381,8 +434,14 @@ class AniListAPI:
         """
         
         variables = {"perPage": per_page}
-        result = await self._make_request(graphql_query, variables)
-        return result.get("Page", {}).get("media", [])
+        cache_key = f"trending:{per_page}"
+        
+        try:
+            result = await self._make_request(graphql_query, variables, cache_key)
+            return result.get("Page", {}).get("media", [])
+        except Exception as e:
+            print(f"Trending error: {e}")
+            return []
     
     async def get_popular_anime(self, per_page: int = 15) -> List[Dict]:
         """Get popular anime"""
@@ -409,8 +468,14 @@ class AniListAPI:
         """
         
         variables = {"perPage": per_page}
-        result = await self._make_request(graphql_query, variables)
-        return result.get("Page", {}).get("media", [])
+        cache_key = f"popular:{per_page}"
+        
+        try:
+            result = await self._make_request(graphql_query, variables, cache_key)
+            return result.get("Page", {}).get("media", [])
+        except Exception as e:
+            print(f"Popular error: {e}")
+            return []
     
     async def get_seasonal_anime(self, year: int = None, season: str = None) -> List[Dict]:
         """Get seasonal anime"""
@@ -459,22 +524,36 @@ class AniListAPI:
             "seasonYear": year,
             "perPage": 20
         }
-        result = await self._make_request(graphql_query, variables)
-        return result.get("Page", {}).get("media", [])
+        cache_key = f"seasonal:{year}:{season}"
+        
+        try:
+            result = await self._make_request(graphql_query, variables, cache_key)
+            return result.get("Page", {}).get("media", [])
+        except Exception as e:
+            print(f"Seasonal error: {e}")
+            return []
     
     async def get_upcoming_anime(self, per_page: int = 15) -> List[Dict]:
         """Get upcoming anime"""
-        next_season_year = datetime.now().year
-        next_season_month = ((datetime.now().month - 1) // 3 + 1) * 3 + 1
-        if next_season_month > 12:
-            next_season_month = 1
-            next_season_year += 1
+        # Get next season
+        today = datetime.now()
+        month = today.month
+        year = today.year
         
-        next_season = {
-            1: "WINTER", 4: "SPRING", 7: "SUMMER", 10: "FALL"
-        }.get(next_season_month, "WINTER")
+        if month in [1, 2, 3]:  # Winter -> Spring
+            next_season = "SPRING"
+            next_year = year
+        elif month in [4, 5, 6]:  # Spring -> Summer
+            next_season = "SUMMER"
+            next_year = year
+        elif month in [7, 8, 9]:  # Summer -> Fall
+            next_season = "FALL"
+            next_year = year
+        else:  # Fall -> Winter (next year)
+            next_season = "WINTER"
+            next_year = year + 1
         
-        return await self.get_seasonal_anime(next_season_year, next_season)
+        return await self.get_seasonal_anime(next_year, next_season)
     
     async def get_airing_schedule(self) -> List[Dict]:
         """Get today's airing schedule"""
@@ -515,9 +594,14 @@ class AniListAPI:
             "airingAt_greater": start_of_day,
             "airingAt_lesser": end_of_day
         }
+        cache_key = f"schedule:{today.strftime('%Y%m%d')}"
         
-        result = await self._make_request(graphql_query, variables)
-        return result.get("Page", {}).get("airingSchedules", [])
+        try:
+            result = await self._make_request(graphql_query, variables, cache_key)
+            return result.get("Page", {}).get("airingSchedules", [])
+        except Exception as e:
+            print(f"Schedule error: {e}")
+            return []
     
     # =========== MANGA QUERIES ===========
     
@@ -584,8 +668,12 @@ class AniListAPI:
             "perPage": per_page
         }
         
-        result = await self._make_request(graphql_query, variables)
-        return result.get("Page", {}).get("media", [])
+        try:
+            result = await self._make_request(graphql_query, variables)
+            return result.get("Page", {}).get("media", [])
+        except Exception as e:
+            print(f"Manga search error: {e}")
+            return []
     
     async def get_manga(self, manga_id: int) -> Dict:
         """Get manga details"""
@@ -643,81 +731,14 @@ class AniListAPI:
         """
         
         variables = {"id": manga_id}
-        result = await self._make_request(graphql_query, variables)
-        return result.get("Media", {})
-    
-    async def get_top_anime(self, page: int = 1, per_page: int = 15) -> List[Dict]:
-        """Get top-rated anime"""
-        graphql_query = """
-        query ($page: Int, $perPage: Int) {
-          Page(page: $page, perPage: $perPage) {
-            media(type: ANIME, sort: SCORE_DESC) {
-              id
-              title {
-                romaji
-                english
-              }
-              coverImage {
-                large
-              }
-              averageScore
-              meanScore
-              popularity
-              format
-              episodes
-              status
-              startDate {
-                year
-              }
-            }
-          }
-        }
-        """
+        cache_key = f"manga:{manga_id}"
         
-        variables = {
-            "page": page,
-            "perPage": per_page
-        }
-        
-        result = await self._make_request(graphql_query, variables)
-        return result.get("Page", {}).get("media", [])
-    
-    async def get_top_manga(self, page: int = 1, per_page: int = 15) -> List[Dict]:
-        """Get top-rated manga"""
-        graphql_query = """
-        query ($page: Int, $perPage: Int) {
-          Page(page: $page, perPage: $perPage) {
-            media(type: MANGA, sort: SCORE_DESC) {
-              id
-              title {
-                romaji
-                english
-              }
-              coverImage {
-                large
-              }
-              averageScore
-              meanScore
-              popularity
-              format
-              chapters
-              volumes
-              status
-              startDate {
-                year
-              }
-            }
-          }
-        }
-        """
-        
-        variables = {
-            "page": page,
-            "perPage": per_page
-        }
-        
-        result = await self._make_request(graphql_query, variables)
-        return result.get("Page", {}).get("media", [])
+        try:
+            result = await self._make_request(graphql_query, variables, cache_key)
+            return result.get("Media", {})
+        except Exception as e:
+            print(f"Get manga error: {e}")
+            return {}
     
     # =========== CHARACTER QUERIES ===========
     
@@ -781,8 +802,12 @@ class AniListAPI:
             "perPage": per_page
         }
         
-        result = await self._make_request(graphql_query, variables)
-        return result.get("Page", {}).get("characters", [])
+        try:
+            result = await self._make_request(graphql_query, variables)
+            return result.get("Page", {}).get("characters", [])
+        except Exception as e:
+            print(f"Character search error: {e}")
+            return []
     
     async def get_character(self, character_id: int) -> Dict:
         """Get character details"""
@@ -841,8 +866,14 @@ class AniListAPI:
         """
         
         variables = {"id": character_id}
-        result = await self._make_request(graphql_query, variables)
-        return result.get("Character", {})
+        cache_key = f"character:{character_id}"
+        
+        try:
+            result = await self._make_request(graphql_query, variables, cache_key)
+            return result.get("Character", {})
+        except Exception as e:
+            print(f"Get character error: {e}")
+            return {}
     
     async def get_character_birthdays(self) -> List[Dict]:
         """Get today's character birthdays"""
@@ -850,6 +881,7 @@ class AniListAPI:
         month = today.month
         day = today.day
         
+        # We'll get popular characters and filter by birthday
         graphql_query = """
         query ($page: Int, $perPage: Int) {
           Page(page: $page, perPage: $perPage) {
@@ -889,17 +921,21 @@ class AniListAPI:
             "perPage": 50
         }
         
-        result = await self._make_request(graphql_query, variables)
-        characters = result.get("Page", {}).get("characters", [])
-        
-        # Filter for today's birthdays
-        today_birthdays = []
-        for char in characters:
-            dob = char.get('dateOfBirth', {})
-            if dob.get('month') == month and dob.get('day') == day:
-                today_birthdays.append(char)
-        
-        return today_birthdays[:10]
+        try:
+            result = await self._make_request(graphql_query, variables)
+            characters = result.get("Page", {}).get("characters", [])
+            
+            # Filter for today's birthdays
+            today_birthdays = []
+            for char in characters:
+                dob = char.get('dateOfBirth', {})
+                if dob.get('month') == month and dob.get('day') == day:
+                    today_birthdays.append(char)
+            
+            return today_birthdays[:10]
+        except Exception as e:
+            print(f"Birthdays error: {e}")
+            return []
     
     # =========== STAFF QUERIES ===========
     
@@ -969,8 +1005,12 @@ class AniListAPI:
             "perPage": per_page
         }
         
-        result = await self._make_request(graphql_query, variables)
-        return result.get("Page", {}).get("staff", [])
+        try:
+            result = await self._make_request(graphql_query, variables)
+            return result.get("Page", {}).get("staff", [])
+        except Exception as e:
+            print(f"Staff search error: {e}")
+            return []
     
     # =========== STUDIO QUERIES ===========
     
@@ -1015,8 +1055,12 @@ class AniListAPI:
             "perPage": per_page
         }
         
-        result = await self._make_request(graphql_query, variables)
-        return result.get("Page", {}).get("studios", [])
+        try:
+            result = await self._make_request(graphql_query, variables)
+            return result.get("Page", {}).get("studios", [])
+        except Exception as e:
+            print(f"Studio search error: {e}")
+            return []
     
     async def get_top_studios(self, per_page: int = 10) -> List[Dict]:
         """Get top studios"""
@@ -1045,8 +1089,13 @@ class AniListAPI:
         """
         
         variables = {"perPage": per_page}
-        result = await self._make_request(graphql_query, variables)
-        return result.get("Page", {}).get("studios", [])
+        
+        try:
+            result = await self._make_request(graphql_query, variables)
+            return result.get("Page", {}).get("studios", [])
+        except Exception as e:
+            print(f"Top studios error: {e}")
+            return []
     
     # =========== USER QUERIES ===========
     
@@ -1295,8 +1344,14 @@ class AniListAPI:
         """
         
         variables = {"name": username}
-        result = await self._make_request(graphql_query, variables)
-        return result.get("User", {})
+        cache_key = f"user:{username.lower()}"
+        
+        try:
+            result = await self._make_request(graphql_query, variables, cache_key)
+            return result.get("User", {})
+        except Exception as e:
+            print(f"User profile error: {e}")
+            return {}
     
     async def get_user_list(self, username: str, media_type: str = "ANIME") -> List[Dict]:
         """Get user's anime/manga list"""
@@ -1364,16 +1419,106 @@ class AniListAPI:
             "userName": username,
             "type": media_type
         }
+        cache_key = f"userlist:{username.lower()}:{media_type}"
         
-        result = await self._make_request(graphql_query, variables)
-        collection = result.get("MediaListCollection", {})
-        lists = collection.get("lists", [])
+        try:
+            result = await self._make_request(graphql_query, variables, cache_key)
+            collection = result.get("MediaListCollection", {})
+            lists = collection.get("lists", [])
+            
+            all_entries = []
+            for list_data in lists:
+                all_entries.extend(list_data.get("entries", []))
+            
+            return all_entries
+        except Exception as e:
+            print(f"User list error: {e}")
+            return []
+    
+    # =========== TOP RATED QUERIES ===========
+    
+    async def get_top_anime(self, page: int = 1, per_page: int = 15) -> List[Dict]:
+        """Get top-rated anime"""
+        graphql_query = """
+        query ($page: Int, $perPage: Int) {
+          Page(page: $page, perPage: $perPage) {
+            media(type: ANIME, sort: SCORE_DESC) {
+              id
+              title {
+                romaji
+                english
+              }
+              coverImage {
+                large
+              }
+              averageScore
+              meanScore
+              popularity
+              format
+              episodes
+              status
+              startDate {
+                year
+              }
+            }
+          }
+        }
+        """
         
-        all_entries = []
-        for list_data in lists:
-            all_entries.extend(list_data.get("entries", []))
+        variables = {
+            "page": page,
+            "perPage": per_page
+        }
+        cache_key = f"topanime:{page}:{per_page}"
         
-        return all_entries
+        try:
+            result = await self._make_request(graphql_query, variables, cache_key)
+            return result.get("Page", {}).get("media", [])
+        except Exception as e:
+            print(f"Top anime error: {e}")
+            return []
+    
+    async def get_top_manga(self, page: int = 1, per_page: int = 15) -> List[Dict]:
+        """Get top-rated manga"""
+        graphql_query = """
+        query ($page: Int, $perPage: Int) {
+          Page(page: $page, perPage: $perPage) {
+            media(type: MANGA, sort: SCORE_DESC) {
+              id
+              title {
+                romaji
+                english
+              }
+              coverImage {
+                large
+              }
+              averageScore
+              meanScore
+              popularity
+              format
+              chapters
+              volumes
+              status
+              startDate {
+                year
+              }
+            }
+          }
+        }
+        """
+        
+        variables = {
+            "page": page,
+            "perPage": per_page
+        }
+        cache_key = f"topmanga:{page}:{per_page}"
+        
+        try:
+            result = await self._make_request(graphql_query, variables, cache_key)
+            return result.get("Page", {}).get("media", [])
+        except Exception as e:
+            print(f"Top manga error: {e}")
+            return []
     
     # =========== STATISTICS QUERIES ===========
     
@@ -1408,8 +1553,13 @@ class AniListAPI:
         """
         
         variables = {"id": anime_id}
-        result = await self._make_request(graphql_query, variables)
-        return result.get("Media", {})
+        
+        try:
+            result = await self._make_request(graphql_query, variables)
+            return result.get("Media", {})
+        except Exception as e:
+            print(f"Anime stats error: {e}")
+            return {}
     
     async def get_genre_stats(self) -> List[Dict]:
         """Get genre statistics"""
@@ -1419,10 +1569,13 @@ class AniListAPI:
         }
         """
         
-        result = await self._make_request(graphql_query)
-        genres = result.get("GenreCollection", [])
-        
-        return [{"name": genre, "count": 0} for genre in genres[:20]]
+        try:
+            result = await self._make_request(graphql_query)
+            genres = result.get("GenreCollection", [])
+            return [{"name": genre, "count": 0} for genre in genres[:20]]
+        except Exception as e:
+            print(f"Genre stats error: {e}")
+            return []
     
     # =========== RELATION QUERIES ===========
     
@@ -1458,9 +1611,14 @@ class AniListAPI:
         """
         
         variables = {"id": anime_id}
-        result = await self._make_request(graphql_query, variables)
-        media = result.get("Media", {})
-        return media.get("relations", {}).get("edges", [])
+        
+        try:
+            result = await self._make_request(graphql_query, variables)
+            media = result.get("Media", {})
+            return media.get("relations", {}).get("edges", [])
+        except Exception as e:
+            print(f"Anime relations error: {e}")
+            return []
     
     async def get_anime_characters(self, anime_id: int) -> List[Dict]:
         """Get anime characters"""
@@ -1490,9 +1648,14 @@ class AniListAPI:
         """
         
         variables = {"id": anime_id}
-        result = await self._make_request(graphql_query, variables)
-        media = result.get("Media", {})
-        return media.get("characters", {}).get("edges", [])
+        
+        try:
+            result = await self._make_request(graphql_query, variables)
+            media = result.get("Media", {})
+            return media.get("characters", {}).get("edges", [])
+        except Exception as e:
+            print(f"Anime characters error: {e}")
+            return []
     
     async def get_anime_staff(self, anime_id: int) -> List[Dict]:
         """Get anime staff"""
@@ -1521,9 +1684,14 @@ class AniListAPI:
         """
         
         variables = {"id": anime_id}
-        result = await self._make_request(graphql_query, variables)
-        media = result.get("Media", {})
-        return media.get("staff", {}).get("edges", [])
+        
+        try:
+            result = await self._make_request(graphql_query, variables)
+            media = result.get("Media", {})
+            return media.get("staff", {}).get("edges", [])
+        except Exception as e:
+            print(f"Anime staff error: {e}")
+            return []
     
     async def get_anime_reviews(self, anime_id: int) -> List[Dict]:
         """Get anime reviews"""
@@ -1559,9 +1727,13 @@ class AniListAPI:
             "perPage": 5
         }
         
-        result = await self._make_request(graphql_query, variables)
-        media = result.get("Media", {})
-        return media.get("reviews", {}).get("edges", [])
+        try:
+            result = await self._make_request(graphql_query, variables)
+            media = result.get("Media", {})
+            return media.get("reviews", {}).get("edges", [])
+        except Exception as e:
+            print(f"Anime reviews error: {e}")
+            return []
     
     async def get_anime_recommendations(self, anime_id: int) -> List[Dict]:
         """Get anime recommendations"""
@@ -1599,14 +1771,19 @@ class AniListAPI:
             "perPage": 10
         }
         
-        result = await self._make_request(graphql_query, variables)
-        media = result.get("Media", {})
-        return media.get("recommendations", {}).get("edges", [])
+        try:
+            result = await self._make_request(graphql_query, variables)
+            media = result.get("Media", {})
+            return media.get("recommendations", {}).get("edges", [])
+        except Exception as e:
+            print(f"Anime recommendations error: {e}")
+            return []
     
     # =========== UTILITY QUERIES ===========
     
     async def get_random_anime(self, genre: str = None) -> Dict:
         """Get random anime"""
+        # Get a random page (1-50) and pick first result
         page = random.randint(1, 50)
         
         graphql_query = """
@@ -1639,17 +1816,21 @@ class AniListAPI:
             "genre": genre
         }
         
-        result = await self._make_request(graphql_query, variables)
-        media_list = result.get("Page", {}).get("media", [])
-        
-        if media_list:
-            return media_list[0]
-        return {}
+        try:
+            result = await self._make_request(graphql_query, variables)
+            media_list = result.get("Page", {}).get("media", [])
+            
+            if media_list:
+                return media_list[0]
+            return {}
+        except Exception as e:
+            print(f"Random anime error: {e}")
+            return {}
     
     async def get_anime_news(self, anime_id: int) -> List[Dict]:
         """Get anime news (placeholder)"""
         # Note: AniList doesn't have direct news API
-        # This is a placeholder that could be integrated with other APIs
+        # This could be integrated with other APIs like MyAnimeList
         return []
     
     async def get_anime_trailer(self, anime_id: int) -> Dict:
@@ -1668,23 +1849,63 @@ class AniListAPI:
         """
         
         variables = {"id": anime_id}
-        result = await self._make_request(graphql_query, variables)
-        media = result.get("Media", {})
-        trailer = media.get("trailer", {})
         
-        if trailer and trailer.get('site') == 'youtube':
-            trailer['url'] = f"https://youtube.com/watch?v={trailer['id']}"
-        
-        return trailer
+        try:
+            result = await self._make_request(graphql_query, variables)
+            media = result.get("Media", {})
+            trailer = media.get("trailer", {})
+            
+            if trailer and trailer.get('site') == 'youtube':
+                trailer['url'] = f"https://youtube.com/watch?v={trailer['id']}"
+            
+            return trailer
+        except Exception as e:
+            print(f"Anime trailer error: {e}")
+            return {}
     
     async def get_anime_quote(self) -> Dict:
-        """Get random anime quote (placeholder)"""
+        """Get random anime quote"""
         quotes = [
-            {"quote": "Believe in the me that believes in you!", "character": "Kamina", "anime": "Gurren Lagann"},
-            {"quote": "People's dreams... have no end!", "character": "Marshall D. Teach", "anime": "One Piece"},
-            {"quote": "It's not the face that makes someone a monster; it's the choices they make with their lives.", "character": "Naruto Uzumaki", "anime": "Naruto"},
-            {"quote": "The world isn't perfect. But it's there for us, doing the best it can. That's what makes it so damn beautiful.", "character": "Roy Mustang", "anime": "Fullmetal Alchemist"},
-            {"quote": "If you don't like your destiny, don't accept it. Instead, have the courage to change it the way you want it to be.", "character": "Naruto Uzumaki", "anime": "Naruto"},
+            {
+                "quote": "Believe in the me that believes in you!",
+                "character": "Kamina",
+                "anime": "Gurren Lagann"
+            },
+            {
+                "quote": "People's dreams... have no end!",
+                "character": "Marshall D. Teach",
+                "anime": "One Piece"
+            },
+            {
+                "quote": "It's not the face that makes someone a monster; it's the choices they make with their lives.",
+                "character": "Naruto Uzumaki",
+                "anime": "Naruto"
+            },
+            {
+                "quote": "The world isn't perfect. But it's there for us, doing the best it can. That's what makes it so damn beautiful.",
+                "character": "Roy Mustang",
+                "anime": "Fullmetal Alchemist"
+            },
+            {
+                "quote": "If you don't like your destiny, don't accept it. Instead, have the courage to change it the way you want it to be.",
+                "character": "Naruto Uzumaki",
+                "anime": "Naruto"
+            },
+            {
+                "quote": "I am the hope of the universe. I am the answer to all living things that cry out for peace.",
+                "character": "Goku",
+                "anime": "Dragon Ball Z"
+            },
+            {
+                "quote": "A person grows up when they can overcome hardships. To be able to protect something important.",
+                "character": "Jiraiya",
+                "anime": "Naruto"
+            },
+            {
+                "quote": "Knowing you're different is only the beginning. If you accept these differences you'll be able to get past them and grow even closer.",
+                "character": "Misato Katsuragi",
+                "anime": "Neon Genesis Evangelion"
+            }
         ]
         
         return random.choice(quotes)
@@ -1693,27 +1914,40 @@ class AniListAPI:
         """Close the session"""
         if self.session and not self.session.closed:
             await self.session.close()
+            print("✅ AniListAPI session closed")
 
+# =========== IMAGE GENERATOR CLASS ===========
 class ImageGenerator:
     """Image generator for anime cards"""
     
     def __init__(self):
         self.font_cache = {}
-        self.redis = None
         self.image_cache = {}
         
-    def get_font(self, size: int, bold: bool = False):
-        """Get font with caching"""
+        if not HAS_PILLOW:
+            print("⚠️ Pillow not available, image generation disabled")
+        
+        print("✅ ImageGenerator initialized")
+    
+    def _get_font(self, size: int, bold: bool = False):
+        """Get font with fallback"""
         try:
+            # Try to load system fonts
             if bold:
-                return ImageFont.truetype("arialbd.ttf", size)
+                try:
+                    return ImageFont.truetype("arialbd.ttf", size)
+                except:
+                    return ImageFont.truetype("DejaVuSans-Bold.ttf", size)
             else:
-                return ImageFont.truetype("arial.ttf", size)
+                try:
+                    return ImageFont.truetype("arial.ttf", size)
+                except:
+                    return ImageFont.truetype("DejaVuSans.ttf", size)
         except:
-            # Fallback to default font
+            # Ultimate fallback
             return ImageFont.load_default()
     
-    async def download_image(self, url: str) -> Optional[Image.Image]:
+    async def _download_image(self, url: str) -> Optional[Image.Image]:
         """Download image from URL"""
         if not url:
             return None
@@ -1726,29 +1960,14 @@ class ImageGenerator:
             print(f"Failed to download image: {e}")
         return None
     
-    def add_rounded_corners(self, image, radius=20):
-        """Add rounded corners to image"""
-        circle = Image.new('L', (radius * 2, radius * 2), 0)
-        draw = ImageDraw.Draw(circle)
-        draw.ellipse((0, 0, radius * 2, radius * 2), fill=255)
-        
-        alpha = Image.new('L', image.size, 255)
-        w, h = image.size
-        
-        # Create rounded corners
-        alpha.paste(circle.crop((0, 0, radius, radius)), (0, 0))
-        alpha.paste(circle.crop((radius, 0, radius * 2, radius)), (w - radius, 0))
-        alpha.paste(circle.crop((0, radius, radius, radius * 2)), (0, h - radius))
-        alpha.paste(circle.crop((radius, radius, radius * 2, radius * 2)), (w - radius, h - radius))
-        
-        image.putalpha(alpha)
-        return image
-    
-    def wrap_text(self, text: str, max_width: int, font) -> List[str]:
+    def _wrap_text(self, text: str, max_width: int, font) -> List[str]:
         """Wrap text to fit within width"""
+        if not text:
+            return []
+        
         lines = []
-        current_line = []
         words = text.split()
+        current_line = []
         
         for word in words:
             test_line = ' '.join(current_line + [word])
@@ -1767,16 +1986,15 @@ class ImageGenerator:
         
         return lines
     
-    async def generate_anime_card(self, anime_data: Dict) -> str:
+    async def generate_anime_card(self, anime_data: Dict) -> Optional[str]:
         """Generate anime info card image"""
+        if not HAS_PILLOW:
+            return None
+        
         try:
-            # Update image generation stats
-            if hasattr(self, 'redis') and self.redis:
-                self.redis.incr("stats:image_gen")
-            
             # Create canvas
             width, height = 800, 1000
-            image = Image.new('RGB', (width, height), '#0f172a')
+            image = Image.new('RGB', (width, height), '#0f172a')  # Dark blue background
             draw = ImageDraw.Draw(image)
             
             # Download cover image
@@ -1784,33 +2002,31 @@ class ImageGenerator:
             cover_img = None
             
             if cover_url:
-                try:
-                    cover_img = await self.download_image(cover_url)
-                    if cover_img:
-                        # Resize and position
-                        cover_img = cover_img.resize((800, 300))
-                        
-                        # Add gradient overlay
-                        gradient = Image.new('RGBA', (800, 300), (15, 23, 42, 180))
-                        cover_img.paste(gradient, (0, 0), gradient)
-                        
-                        image.paste(cover_img, (0, 0))
-                except:
-                    pass
+                cover_img = await self._download_image(cover_url)
+                if cover_img:
+                    # Resize and add to image
+                    cover_img = cover_img.resize((800, 300))
+                    
+                    # Add dark overlay
+                    overlay = Image.new('RGBA', (800, 300), (15, 23, 42, 180))
+                    cover_img.paste(overlay, (0, 0), overlay)
+                    
+                    image.paste(cover_img, (0, 0))
             
             # Title
             title = anime_data.get('title', {}).get('english') or anime_data.get('title', {}).get('romaji', 'N/A')
-            title_font = self.get_font(36, bold=True)
-            draw.text((50, 320), title, fill='white', font=title_font, stroke_width=1, stroke_fill='black')
+            title_font = self._get_font(36, bold=True)
+            draw.text((50, 320), title, fill='white', font=title_font)
             
             # Score badge
             score = anime_data.get('averageScore')
             if score:
                 # Draw circular badge
-                draw.ellipse([(50, 380), (110, 440)], fill='#f59e0b' if score >= 80 else '#10b981' if score >= 60 else '#ef4444')
-                score_font = self.get_font(24, bold=True)
+                draw.ellipse([(50, 380), (110, 440)], 
+                           fill='#f59e0b' if score >= 80 else '#10b981' if score >= 60 else '#ef4444')
+                score_font = self._get_font(24, bold=True)
                 draw.text((63, 390), str(score), fill='white', font=score_font)
-                draw.text((120, 395), "Score", fill='#94a3b8', font=self.get_font(16))
+                draw.text((120, 395), "Score", fill='#94a3b8', font=self._get_font(16))
             
             # Status
             status = anime_data.get('status', 'N/A').capitalize()
@@ -1822,98 +2038,85 @@ class ImageGenerator:
                 'Hiatus': '#8b5cf6'
             }.get(status, '#64748b')
             
-            status_width = 150
-            status_x = 220
-            draw.rounded_rectangle([(status_x, 380), (status_x + status_width, 420)], radius=10, fill=status_color)
-            draw.text((status_x + 10, 385), status, fill='white', font=self.get_font(18, bold=True))
+            draw.rounded_rectangle([(200, 380), (350, 420)], radius=10, fill=status_color)
+            draw.text((210, 385), status, fill='white', font=self._get_font(18, bold=True))
             
             # Info section
             y_offset = 450
-        
+            
             # Format and episodes
             format_text = anime_data.get('format', 'N/A')
             episodes = anime_data.get('episodes', 'N/A')
-            info_text = f"{format_text} • {episodes} episodes • {anime_data.get('duration', 'N/A')}min"
-            draw.text((50, y_offset), info_text, fill='#cbd5e1', font=self.get_font(18))
+            info_text = f"{format_text} • {episodes} episodes"
+            draw.text((50, y_offset), info_text, fill='#cbd5e1', font=self._get_font(18))
             y_offset += 40
-        
+            
             # Genres
             genres = anime_data.get('genres', [])[:5]
             if genres:
                 genre_text = " • ".join(genres)
-                draw.text((50, y_offset), genre_text, fill='#60a5fa', font=self.get_font(16))
+                draw.text((50, y_offset), genre_text, fill='#60a5fa', font=self._get_font(16))
                 y_offset += 40
-        
+            
             # Studios
             studios = [edge.get('node', {}).get('name') for edge in anime_data.get('studios', {}).get('edges', [])[:3]]
             if studios:
                 studio_text = f"Studio: {', '.join(studios)}"
-                draw.text((50, y_offset), studio_text, fill='#cbd5e1', font=self.get_font(16))
+                draw.text((50, y_offset), studio_text, fill='#cbd5e1', font=self._get_font(16))
                 y_offset += 40
             
             # Description
             description = anime_data.get('description', 'No description available.')
-            # Remove HTML tags and limit length
-            import re
+            # Remove HTML tags
             description = re.sub(r'<[^>]+>', '', description)[:400]
             
             desc_y = 580
-            draw.text((50, desc_y), "📖 Description:", fill='#fbbf24', font=self.get_font(18, bold=True))
+            draw.text((50, desc_y), "📖 Description:", fill='#fbbf24', font=self._get_font(18, bold=True))
             desc_y += 40
             
             # Wrap and draw description
-            desc_lines = textwrap.wrap(description, width=60)
+            desc_lines = self._wrap_text(description, 90, self._get_font(14))
             for i, line in enumerate(desc_lines[:6]):
-                draw.text((70, desc_y + i*25), line, fill='#e2e8f0', font=self.get_font(14))
+                draw.text((70, desc_y + i*25), line, fill='#e2e8f0', font=self._get_font(14))
             
             # Stats section
             stats_y = 750
-        
+            
             # Popularity and favorites
             popularity = anime_data.get('popularity', 'N/A')
             favorites = anime_data.get('favourites', 'N/A')
             
             stats_text = f"📊 Popularity: #{popularity} | ❤️ Favorites: {favorites}"
-            draw.text((50, stats_y), stats_text, fill='#cbd5e1', font=self.get_font(16))
-        
-            # Airing info
-            if anime_data.get('status') == 'RELEASING':
-                next_ep = anime_data.get('nextAiringEpisode', {})
-                if next_ep:
-                    episode = next_ep.get('episode', 'N/A')
-                    airing_at = next_ep.get('airingAt', 0)
-                    
-                    if airing_at:
-                        from datetime import datetime
-                        airing_time = datetime.fromtimestamp(airing_at)
-                        time_str = airing_time.strftime("%b %d, %H:%M")
-                        
-                        draw.text((50, stats_y + 30), f"📺 Next Episode: #{episode} on {time_str}", 
-                                 fill='#10b981', font=self.get_font(16))
+            draw.text((50, stats_y), stats_text, fill='#cbd5e1', font=self._get_font(16))
             
             # Footer
             footer_y = height - 50
-            draw.text((50, footer_y), "AnimeKuun Bot • anilist.co", fill='#64748b', font=self.get_font(14))
-            
-            # QR code placeholder
-            draw.text((width - 200, footer_y), "📱 Scan for AniList", fill='#3b82f6', font=self.get_font(12))
+            draw.text((50, footer_y), "AnimeKuun Bot • anilist.co", fill='#64748b', font=self._get_font(14))
             
             # Save image
-            output_path = f"anime_{anime_data['id']}_{int(time.time())}.jpg"
+            import tempfile
+            import uuid
+            temp_dir = tempfile.gettempdir()
+            filename = f"anime_{anime_data.get('id', uuid.uuid4())}.jpg"
+            output_path = os.path.join(temp_dir, filename)
+            
             image.save(output_path, 'JPEG', quality=90)
+            print(f"✅ Generated image: {output_path}")
             
             return output_path
             
         except Exception as e:
             print(f"Image generation error: {e}")
+            import traceback
+            traceback.print_exc()
             return None
     
-    async def generate_user_card(self, user_data: Dict) -> str:
+    async def generate_user_card(self, user_data: Dict) -> Optional[str]:
         """Generate user profile card"""
+        if not HAS_PILLOW:
+            return None
+        
         try:
-            if hasattr(self, 'redis') and self.redis:
-                self.redis.incr("stats:image_gen")
-            
             # Create canvas
             width, height = 800, 1000
             image = Image.new('RGB', (width, height), '#0f172a')
@@ -1924,55 +2127,36 @@ class ImageGenerator:
             avatar_img = None
             
             if avatar_url:
-                try:
-                    avatar_img = await self.download_image(avatar_url)
-                    if avatar_img:
-                        # Create circular avatar
-                        avatar_img = avatar_img.resize((200, 200))
-                        
-                        # Create circular mask
-                        mask = Image.new('L', (200, 200), 0)
-                        mask_draw = ImageDraw.Draw(mask)
-                        mask_draw.ellipse([(0, 0), (200, 200)], fill=255)
-                        
-                        # Apply mask
-                        avatar_img.putalpha(mask)
-                        
-                        # Add shadow
-                        shadow = Image.new('RGBA', (210, 210), (0, 0, 0, 100))
-                        shadow_mask = Image.new('L', (210, 210), 0)
-                        shadow_draw = ImageDraw.Draw(shadow_mask)
-                        shadow_draw.ellipse([(0, 0), (210, 210)], fill=255)
-                        shadow.putalpha(shadow_mask)
-                        
-                        image.paste(shadow, (45, 45), shadow)
-                        image.paste(avatar_img, (50, 50), avatar_img)
-                except:
-                    pass
+                avatar_img = await self._download_image(avatar_url)
+                if avatar_img:
+                    # Create circular avatar
+                    avatar_img = avatar_img.resize((200, 200))
+                    
+                    # Create circular mask
+                    mask = Image.new('L', (200, 200), 0)
+                    mask_draw = ImageDraw.Draw(mask)
+                    mask_draw.ellipse([(0, 0), (200, 200)], fill=255)
+                    
+                    # Apply mask
+                    avatar_img.putalpha(mask)
+                    
+                    image.paste(avatar_img, (50, 50), avatar_img)
             
             # Username
             username = user_data.get('name', 'N/A')
-            name_font = self.get_font(42, bold=True)
+            name_font = self._get_font(42, bold=True)
             draw.text((270, 70), username, fill='white', font=name_font)
-            
-            # Donator badge
-            donator_tier = user_data.get('donatorTier', 0)
-            if donator_tier > 0:
-                badge_color = '#fbbf24' if donator_tier >= 3 else '#cbd5e1' if donator_tier >= 2 else '#b45309'
-                draw.ellipse([(270, 130), (310, 170)], fill=badge_color)
-                draw.text((280, 135), "★", fill='white', font=self.get_font(20, bold=True))
-                draw.text((320, 140), f"Tier {donator_tier} Donator", fill=badge_color, font=self.get_font(16))
             
             # About section
             about = user_data.get('about', 'No bio available.')[:300]
             
             y_offset = 220
-            draw.text((50, y_offset), "📝 About:", fill='#3b82f6', font=self.get_font(18, bold=True))
+            draw.text((50, y_offset), "📝 About:", fill='#3b82f6', font=self._get_font(18, bold=True))
             y_offset += 40
             
-            about_lines = textwrap.wrap(about, width=50)
+            about_lines = self._wrap_text(about, 50, self._get_font(14))
             for i, line in enumerate(about_lines[:6]):
-                draw.text((70, y_offset + i*25), line, fill='#e2e8f0', font=self.get_font(14))
+                draw.text((70, y_offset + i*25), line, fill='#e2e8f0', font=self._get_font(14))
             
             # Statistics
             stats = user_data.get('statistics', {}).get('anime', {})
@@ -1999,67 +2183,37 @@ class ImageGenerator:
                                       radius=15, fill='#1e293b')
                 
                 # Draw label and value
-                draw.text((x + 10, y + 10), label, fill='#94a3b8', font=self.get_font(14))
-                draw.text((x + 10, y + 40), value, fill='white', font=self.get_font(20, bold=True))
-            
-            # Status distribution
-            status_y = stats_y + box_height * 2 + box_margin + 20
-            draw.text((50, status_y), "📊 Anime Status:", fill='#10b981', font=self.get_font(18, bold=True))
-            status_y += 40
-            
-            status_dist = stats.get('statuses', [])
-            if status_dist:
-                # Find max count for scaling
-                max_count = max([s.get('count', 0) for s in status_dist])
-                
-                for i, status in enumerate(status_dist[:5]):
-                    status_name = status.get('status', '').capitalize()
-                    count = status.get('count', 0)
-                    
-                    # Draw status name
-                    draw.text((70, status_y + i*35), status_name, fill='white', font=self.get_font(16))
-                    
-                    # Draw progress bar
-                    bar_width = int((count / max_count) * 400) if max_count > 0 else 0
-                    bar_height = 20
-                    
-                    colors = {
-                        'Watching': '#3b82f6',
-                        'Completed': '#10b981',
-                        'Planning': '#f59e0b',
-                        'Dropped': '#ef4444',
-                        'Paused': '#8b5cf6'
-                    }
-                    
-                    bar_color = colors.get(status_name, '#64748b')
-                    
-                    draw.rounded_rectangle([(200, status_y + i*35), (200 + bar_width, status_y + i*35 + bar_height)], 
-                                          radius=10, fill=bar_color)
-                    
-                    # Draw count
-                    draw.text((210 + bar_width, status_y + i*35), f"{count:,}", 
-                             fill='#cbd5e1', font=self.get_font(14))
+                draw.text((x + 10, y + 10), label, fill='#94a3b8', font=self._get_font(14))
+                draw.text((x + 10, y + 40), value, fill='white', font=self._get_font(20, bold=True))
             
             # Footer
             footer_y = height - 50
-            draw.text((50, footer_y), "AnimeKuun Bot • User Profile", fill='#64748b', font=self.get_font(14))
+            draw.text((50, footer_y), "AnimeKuun Bot • User Profile", fill='#64748b', font=self._get_font(14))
             
             # Save image
-            output_path = f"user_{user_data.get('id', int(time.time()))}_{int(time.time())}.jpg"
+            import tempfile
+            import uuid
+            temp_dir = tempfile.gettempdir()
+            filename = f"user_{user_data.get('id', uuid.uuid4())}.jpg"
+            output_path = os.path.join(temp_dir, filename)
+            
             image.save(output_path, 'JPEG', quality=90)
+            print(f"✅ Generated user image: {output_path}")
             
             return output_path
             
         except Exception as e:
             print(f"User card generation error: {e}")
+            import traceback
+            traceback.print_exc()
             return None
     
-    async def generate_character_card(self, character_data: Dict) -> str:
+    async def generate_character_card(self, character_data: Dict) -> Optional[str]:
         """Generate character card"""
+        if not HAS_PILLOW:
+            return None
+        
         try:
-            if hasattr(self, 'redis') and self.redis:
-                self.redis.incr("stats:image_gen")
-            
             # Create canvas
             width, height = 800, 1000
             image = Image.new('RGB', (width, height), '#0f172a')
@@ -2070,98 +2224,71 @@ class ImageGenerator:
             char_img = None
             
             if char_url:
-                try:
-                    char_img = await self.download_image(char_url)
-                    if char_img:
-                        # Resize and position
-                        char_img = char_img.resize((400, 500))
-                        
-                        # Add gradient overlay
-                        gradient = Image.new('RGBA', (400, 500), (15, 23, 42, 150))
-                        char_img.paste(gradient, (0, 0), gradient)
-                        
-                        image.paste(char_img, (0, 0))
-                except:
-                    pass
+                char_img = await self._download_image(char_url)
+                if char_img:
+                    # Resize and position
+                    char_img = char_img.resize((400, 500))
+                    image.paste(char_img, (0, 0))
             
             # Character name
             name = character_data.get('name', {}).get('full', 'N/A')
-            name_font = self.get_font(48, bold=True)
-            draw.text((420, 50), name, fill='white', font=name_font, stroke_width=1, stroke_fill='black')
-            
-            # Native name
-            native_name = character_data.get('name', {}).get('native', '')
-            if native_name:
-                draw.text((420, 120), native_name, fill='#fbbf24', font=self.get_font(24))
+            name_font = self._get_font(48, bold=True)
+            draw.text((420, 50), name, fill='white', font=name_font)
             
             # Character info
             y_offset = 200
-        
+            
             # Gender and age
             gender = character_data.get('gender', 'Unknown')
             age = character_data.get('age', 'Unknown')
-            draw.text((420, y_offset), f"⚧ {gender} • 🎂 {age}", fill='#3b82f6', font=self.get_font(18))
+            draw.text((420, y_offset), f"⚧ {gender} • 🎂 {age}", fill='#3b82f6', font=self._get_font(18))
             y_offset += 40
-        
-            # Birthday
-            dob = character_data.get('dateOfBirth', {})
-            if dob.get('year'):
-                birthday = f"{dob.get('month', '?')}/{dob.get('day', '?')}/{dob.get('year', '?')}"
-                draw.text((420, y_offset), f"🎁 {birthday}", fill='#10b981', font=self.get_font(18))
-                y_offset += 40
-        
-            # Blood type
-            blood_type = character_data.get('bloodType', 'Unknown')
-            if blood_type != 'Unknown':
-                draw.text((420, y_offset), f"💉 Blood Type: {blood_type}", fill='#ec4899', font=self.get_font(18))
-                y_offset += 40
-        
+            
             # Favorites
             favorites = character_data.get('favourites', 0)
-            draw.text((420, y_offset), f"❤️ {favorites:,} favorites", fill='#ef4444', font=self.get_font(18))
+            draw.text((420, y_offset), f"❤️ {favorites:,} favorites", fill='#ef4444', font=self._get_font(18))
             y_offset += 60
             
             # Description
             description = character_data.get('description', 'No description available.')
-            import re
             description = re.sub(r'<[^>]+>', '', description)
             
-            draw.text((420, y_offset), "📖 Description:", fill='#fbbf24', font=self.get_font(16, bold=True))
+            draw.text((420, y_offset), "📖 Description:", fill='#fbbf24', font=self._get_font(16, bold=True))
             y_offset += 40
             
-            desc_lines = textwrap.wrap(description, width=40)
+            desc_lines = self._wrap_text(description, 40, self._get_font(14))
             for i, line in enumerate(desc_lines[:8]):
-                draw.text((440, y_offset + i*25), line, fill='#e2e8f0', font=self.get_font(14))
-            
-            # Anime appearances
-            media = character_data.get('media', {}).get('edges', [])
-            if media:
-                media_y = 650
-                draw.text((50, media_y), "🎬 Appears in:", fill='#3b82f6', font=self.get_font(18, bold=True))
-                media_y += 40
-                
-                for i, edge in enumerate(media[:5]):
-                    anime = edge.get('node', {})
-                    title = anime.get('title', {}).get('english') or anime.get('title', {}).get('romaji', 'N/A')
-                    role = edge.get('role', 'Supporting')
-                    
-                    draw.text((70, media_y + i*30), f"• {title}", fill='white', font=self.get_font(14))
-                    draw.text((550, media_y + i*30), role, fill='#10b981', font=self.get_font(12))
+                draw.text((440, y_offset + i*25), line, fill='#e2e8f0', font=self._get_font(14))
             
             # Footer
             footer_y = height - 50
-            draw.text((50, footer_y), "AnimeKuun Bot • Character Card", fill='#64748b', font=self.get_font(14))
+            draw.text((50, footer_y), "AnimeKuun Bot • Character Card", fill='#64748b', font=self._get_font(14))
             
             # Save image
-            output_path = f"character_{character_data.get('id', int(time.time()))}_{int(time.time())}.jpg"
+            import tempfile
+            import uuid
+            temp_dir = tempfile.gettempdir()
+            filename = f"character_{character_data.get('id', uuid.uuid4())}.jpg"
+            output_path = os.path.join(temp_dir, filename)
+            
             image.save(output_path, 'JPEG', quality=90)
+            print(f"✅ Generated character image: {output_path}")
             
             return output_path
             
         except Exception as e:
             print(f"Character card generation error: {e}")
+            import traceback
+            traceback.print_exc()
             return None
     
     async def close(self):
         """Cleanup"""
-        pass
+        print("✅ ImageGenerator cleaned up")
+
+# =========== SETUP LOGGING ===========
+import logging
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger(__name__)
+
+print("✅ anilist_api.py loaded successfully")
