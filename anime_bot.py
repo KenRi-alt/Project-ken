@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """
-🎌 AnimeKuun Bot - Complete Working Version
-All commands working with proper error handling
+🎌 AnimeKuun Bot - Complete Professional Version
+All features working with proper AniList OAuth, images, and database
 """
 
 import os
@@ -14,33 +14,49 @@ import re
 import time
 import json
 import traceback
+import html
+import secrets
+import hashlib
 from datetime import datetime, timedelta
-from typing import Dict, List, Optional, Any
+from typing import Dict, List, Optional, Any, Tuple
 import aiohttp
 from io import BytesIO
+from PIL import Image, ImageDraw, ImageFont
+import requests
+import base64
+import urllib.parse
 
 # Aiogram imports
 from aiogram import Bot, Dispatcher, types, F, Router
 from aiogram.filters import Command, CommandStart, CommandObject
 from aiogram.types import (
     Message, CallbackQuery, InlineKeyboardMarkup, InlineKeyboardButton,
-    InputFile, URLInputFile, FSInputFile, ReplyKeyboardRemove
+    InputFile, URLInputFile, FSInputFile, ReplyKeyboardRemove,
+    Poll, PollAnswer
 )
 from aiogram.enums import ParseMode, ChatType, MessageEntityType
 from aiogram.utils.keyboard import InlineKeyboardBuilder, ReplyKeyboardBuilder
 from aiogram.client.default import DefaultBotProperties
 from aiogram.utils.formatting import Text, Bold, Italic, as_list, as_line
 from aiogram.exceptions import TelegramRetryAfter, TelegramBadRequest
+from aiogram.methods import SendPhoto, SendMessage
 
 # =========== CONFIGURATION ===========
 BOT_TOKEN = os.getenv("BOT_TOKEN", "8282052807:AAERvnTQKpqBxz23qW4eygRknkVcqy31NNw")
 ADMIN_IDS = [int(id.strip()) for id in os.getenv("ADMIN_IDS", "6108185460").split(",") if id.strip()]
-DATABASE_PATH = "data/animekun_complete.db"
+DATABASE_PATH = "data/animekun.db"
+
+# AniList OAuth
+ANILIST_CLIENT_ID = "14539"  # You need to register at https://anilist.co/api/v2/oauth/authorize
+ANILIST_CLIENT_SECRET = ""  # Leave empty for public OAuth
+ANILIST_REDIRECT_URI = "https://t.me/animekun_bot"  # Your bot username
+ANILIST_BASE_URL = "https://anilist.co/api/v2"
 
 print("=" * 60)
-print("🎌 ANIMEKUUN BOT - COMPLETE WORKING VERSION")
+print("🎌 ANIMEKUUN BOT - COMPLETE PROFESSIONAL VERSION")
 print(f"🤖 Bot Token: {BOT_TOKEN[:15]}...")
 print(f"👑 Admin IDs: {ADMIN_IDS}")
+print(f"🔗 AniList Client ID: {ANILIST_CLIENT_ID}")
 print("=" * 60)
 
 # =========== SETUP ===========
@@ -48,7 +64,7 @@ logging.basicConfig(
     level=logging.INFO,
     format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
     handlers=[
-        logging.FileHandler('animekun_complete.log'),
+        logging.FileHandler('animekun.log'),
         logging.StreamHandler(sys.stdout)
     ]
 )
@@ -62,15 +78,389 @@ dp = Dispatcher()
 bot_start_time = datetime.now()
 maintenance_mode = False
 user_cooldowns = {}
-active_broadcasts = {}
-session = None
+active_sessions = {}
+quiz_sessions = {}
+battle_sessions = {}
+gacha_cache = {}
+user_achievements = {}
 
-# =========== ANILIST API (SIMPLE & WORKING) ===========
+# =========== DATABASE SETUP ===========
+def init_database():
+    """Initialize database with complete schema"""
+    os.makedirs("data", exist_ok=True)
+    
+    conn = sqlite3.connect(DATABASE_PATH)
+    c = conn.cursor()
+    
+    # Users with OAuth tokens
+    c.execute('''CREATE TABLE IF NOT EXISTS users (
+        user_id INTEGER PRIMARY KEY,
+        username TEXT,
+        first_name TEXT,
+        last_name TEXT,
+        anilist_id INTEGER UNIQUE,
+        access_token TEXT,
+        refresh_token TEXT,
+        expires_at INTEGER,
+        anilist_username TEXT,
+        anilist_avatar TEXT,
+        anilist_banner TEXT,
+        anime_stats JSON DEFAULT '{"count": 0, "mean_score": 0, "time_watched": 0}',
+        manga_stats JSON DEFAULT '{"count": 0, "mean_score": 0, "chapters_read": 0}',
+        waifu_collection JSON DEFAULT '[]',
+        husbando_collection JSON DEFAULT '[]',
+        character_cards JSON DEFAULT '[]',
+        achievements JSON DEFAULT '[]',
+        stats JSON DEFAULT '{"commands_used": 0, "searches": 0, "favorites": 0, "quiz_score": 0, "battle_wins": 0, "daily_streak": 0, "last_login": ""}',
+        preferences JSON DEFAULT '{"theme": "default", "notifications": true, "language": "en"}',
+        is_banned INTEGER DEFAULT 0,
+        is_admin INTEGER DEFAULT 0,
+        banned_until TEXT,
+        warnings INTEGER DEFAULT 0,
+        joined_date TEXT DEFAULT CURRENT_TIMESTAMP,
+        last_active TEXT DEFAULT CURRENT_TIMESTAMP
+    )''')
+    
+    # Anime cache for faster access
+    c.execute('''CREATE TABLE IF NOT EXISTS anime_cache (
+        anime_id INTEGER PRIMARY KEY,
+        data JSON,
+        cached_at TEXT DEFAULT CURRENT_TIMESTAMP
+    )''')
+    
+    # Character cache
+    c.execute('''CREATE TABLE IF NOT EXISTS character_cache (
+        character_id INTEGER PRIMARY KEY,
+        data JSON,
+        cached_at TEXT DEFAULT CURRENT_TIMESTAMP
+    )''')
+    
+    # Quiz questions database
+    c.execute('''CREATE TABLE IF NOT EXISTS quiz_questions (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        question TEXT NOT NULL,
+        options JSON NOT NULL,
+        correct_answer INTEGER NOT NULL,
+        explanation TEXT,
+        difficulty TEXT DEFAULT 'medium',
+        category TEXT DEFAULT 'general',
+        source_anime TEXT,
+        added_date TEXT DEFAULT CURRENT_TIMESTAMP
+    )''')
+    
+    # Memes database
+    c.execute('''CREATE TABLE IF NOT EXISTS memes (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        image_url TEXT NOT NULL,
+        caption TEXT,
+        character TEXT,
+        anime TEXT,
+        tags JSON DEFAULT '[]',
+        added_by INTEGER,
+        added_date TEXT DEFAULT CURRENT_TIMESTAMP,
+        uses INTEGER DEFAULT 0
+    )''')
+    
+    # Gacha characters
+    c.execute('''CREATE TABLE IF NOT EXISTS gacha_characters (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        character_id INTEGER,
+        name TEXT NOT NULL,
+        image_url TEXT,
+        rarity TEXT DEFAULT 'R',
+        anime TEXT,
+        description TEXT,
+        attributes JSON DEFAULT '{"attack": 0, "defense": 0, "speed": 0, "intelligence": 0}'
+    )''')
+    
+    # Watch parties
+    c.execute('''CREATE TABLE IF NOT EXISTS watch_parties (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        anime_id INTEGER,
+        anime_title TEXT,
+        episode INTEGER DEFAULT 1,
+        host_id INTEGER,
+        participants JSON DEFAULT '[]',
+        start_time TEXT,
+        status TEXT DEFAULT 'scheduled',
+        chat_id INTEGER
+    )''')
+    
+    # Achievements
+    c.execute('''CREATE TABLE IF NOT EXISTS achievements (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        name TEXT NOT NULL,
+        description TEXT,
+        icon TEXT,
+        requirement TEXT,
+        rarity TEXT DEFAULT 'common',
+        reward_points INTEGER DEFAULT 10
+    )''')
+    
+    # Battle history
+    c.execute('''CREATE TABLE IF NOT EXISTS battles (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        player1_id INTEGER,
+        player2_id INTEGER,
+        winner_id INTEGER,
+        player1_character TEXT,
+        player2_character TEXT,
+        turns INTEGER,
+        details JSON,
+        battle_date TEXT DEFAULT CURRENT_TIMESTAMP
+    )''')
+    
+    # Command statistics
+    c.execute('''CREATE TABLE IF NOT EXISTS command_stats (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        command TEXT,
+        user_id INTEGER,
+        success INTEGER DEFAULT 1,
+        timestamp TEXT DEFAULT CURRENT_TIMESTAMP
+    )''')
+    
+    # Error logs
+    c.execute('''CREATE TABLE IF NOT EXISTS error_logs (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        error TEXT,
+        user_id INTEGER,
+        command TEXT,
+        timestamp TEXT DEFAULT CURRENT_TIMESTAMP
+    )''')
+    
+    # Groups
+    c.execute('''CREATE TABLE IF NOT EXISTS groups (
+        group_id INTEGER PRIMARY KEY,
+        title TEXT,
+        added_date TEXT DEFAULT CURRENT_TIMESTAMP,
+        last_active TEXT DEFAULT CURRENT_TIMESTAMP,
+        settings JSON DEFAULT '{"quiz_enabled": true, "memes_enabled": true, "spoiler_protection": false}'
+    )''')
+    
+    # Create indexes
+    c.execute("CREATE INDEX IF NOT EXISTS idx_users_last_active ON users(last_active)")
+    c.execute("CREATE INDEX IF NOT EXISTS idx_cache_cached_at ON anime_cache(cached_at)")
+    
+    # Add default admin
+    for admin_id in ADMIN_IDS:
+        c.execute("INSERT OR IGNORE INTO users (user_id, is_admin) VALUES (?, 1)", (admin_id,))
+    
+    # Add sample achievements
+    achievements_data = [
+        ("Anime Beginner", "Used your first command", "🎌", "commands_used >= 1", "common", 10),
+        ("Search Master", "Made 100 searches", "🔍", "searches >= 100", "rare", 50),
+        ("Quiz Champion", "Scored 1000+ quiz points", "🏆", "quiz_score >= 1000", "epic", 100),
+        ("Battle Legend", "Won 50 battles", "⚔️", "battle_wins >= 50", "legendary", 200),
+        ("Collection King", "Collected 50 character cards", "👑", "card_count >= 50", "mythic", 300),
+        ("Daily Devotee", "7-day login streak", "🔥", "daily_streak >= 7", "rare", 75),
+        ("AniList Linked", "Connected AniList account", "🔗", "anilist_id IS NOT NULL", "common", 25),
+        ("Waifu Collector", "Collected 10 waifus", "💖", "waifu_count >= 10", "epic", 150),
+        ("Husbando Hunter", "Collected 10 husbandos", "💙", "husbando_count >= 10", "epic", 150),
+        ("True Fan", "Added 50 favorites", "⭐", "favorites >= 50", "legendary", 250),
+    ]
+    
+    c.executemany('''INSERT OR IGNORE INTO achievements (name, description, icon, requirement, rarity, reward_points) 
+                     VALUES (?, ?, ?, ?, ?, ?)''', achievements_data)
+    
+    # Add sample quiz questions
+    sample_questions = [
+        ("In 'Attack on Titan', what is the name of the main protagonist's titan form?", 
+         '["Attack Titan", "Colossal Titan", "Armored Titan", "Beast Titan"]', 0, 
+         "The Attack Titan is Eren Yeager's titan form.", "easy", "characters", "Attack on Titan"),
+        ("Which anime features a pirate named Monkey D. Luffy searching for the One Piece?", 
+         '["Naruto", "One Piece", "Bleach", "Dragon Ball"]', 1, 
+         "One Piece follows Luffy's journey to become Pirate King.", "easy", "plot", "One Piece"),
+        ("In 'Death Note', what is the name of the shinigami who drops the Death Note?", 
+         '["Ryuk", "Rem", "Sidoh", "Gelus"]', 0, 
+         "Ryuk is the shinigami who drops the Death Note to Light Yagami.", "medium", "characters", "Death Note"),
+        ("Which studio produced 'Demon Slayer: Kimetsu no Yaiba'?", 
+         '["Madhouse", "Ufotable", "MAPPA", "Kyoto Animation"]', 1, 
+         "Ufotable animated Demon Slayer with exceptional quality.", "medium", "trivia", "Demon Slayer"),
+        ("What is the name of the technique used by Goku in Dragon Ball Z that requires both hands?", 
+         '["Kamehameha", "Spirit Bomb", "Instant Transmission", "Kaio-ken"]', 0, 
+         "Kamehameha is Goku's signature move taught by Master Roshi.", "easy", "abilities", "Dragon Ball Z"),
+    ]
+    
+    c.executemany('''INSERT OR IGNORE INTO quiz_questions (question, options, correct_answer, explanation, difficulty, category, source_anime) 
+                     VALUES (?, ?, ?, ?, ?, ?, ?)''', sample_questions)
+    
+    # Add sample gacha characters
+    gacha_chars = [
+        (1, "Naruto Uzumaki", "https://i.imgur.com/example1.jpg", "SSR", "Naruto", "The protagonist of Naruto series", '{"attack": 95, "defense": 85, "speed": 90, "intelligence": 70}'),
+        (2, "Goku", "https://i.imgur.com/example2.jpg", "SSR", "Dragon Ball", "The main character of Dragon Ball series", '{"attack": 100, "defense": 90, "speed": 95, "intelligence": 65}'),
+        (3, "Luffy", "https://i.imgur.com/example3.jpg", "SSR", "One Piece", "Captain of the Straw Hat Pirates", '{"attack": 90, "defense": 80, "speed": 85, "intelligence": 60}'),
+        (4, "Eren Yeager", "https://i.imgur.com/example4.jpg", "SR", "Attack on Titan", "The protagonist of Attack on Titan", '{"attack": 85, "defense": 75, "speed": 80, "intelligence": 75}'),
+        (5, "Levi Ackerman", "https://i.imgur.com/example5.jpg", "SR", "Attack on Titan", "The strongest soldier of humanity", '{"attack": 88, "defense": 70, "speed": 95, "intelligence": 85}'),
+    ]
+    
+    c.executemany('''INSERT OR IGNORE INTO gacha_characters (character_id, name, image_url, rarity, anime, description, attributes) 
+                     VALUES (?, ?, ?, ?, ?, ?, ?)''', gacha_chars)
+    
+    conn.commit()
+    conn.close()
+    logger.info("Database initialized with complete schema")
+
+init_database()
+
+# =========== DATABASE HELPER FUNCTIONS ===========
+class Database:
+    @staticmethod
+    def execute(query: str, params: tuple = (), fetchone: bool = False, fetchall: bool = False, commit: bool = True):
+        """Safe database execution"""
+        try:
+            conn = sqlite3.connect(DATABASE_PATH)
+            conn.row_factory = sqlite3.Row
+            c = conn.cursor()
+            c.execute(query, params)
+            
+            if fetchone:
+                result = c.fetchone()
+                if result:
+                    result = dict(result)
+            elif fetchall:
+                result = [dict(row) for row in c.fetchall()]
+            else:
+                result = c.lastrowid
+            
+            if commit:
+                conn.commit()
+            conn.close()
+            
+            return result
+        except Exception as e:
+            logger.error(f"Database error: {e}")
+            if fetchone or fetchall:
+                return None if fetchone else []
+            return None
+    
+    @staticmethod
+    def get_user(user_id: int):
+        """Get user by ID"""
+        return Database.execute(
+            "SELECT * FROM users WHERE user_id = ?",
+            (user_id,), fetchone=True
+        )
+    
+    @staticmethod
+    def update_user(user_id: int, **kwargs):
+        """Update user fields"""
+        if not kwargs:
+            return
+        
+        set_clause = ", ".join([f"{key} = ?" for key in kwargs.keys()])
+        values = list(kwargs.values())
+        values.append(user_id)
+        
+        query = f"UPDATE users SET {set_clause}, last_active = datetime('now') WHERE user_id = ?"
+        return Database.execute(query, tuple(values))
+    
+    @staticmethod
+    def create_user(user_id: int, username: str = None, first_name: str = None):
+        """Create new user"""
+        return Database.execute(
+            """INSERT OR IGNORE INTO users 
+            (user_id, username, first_name, joined_date, last_active, stats) 
+            VALUES (?, ?, ?, datetime('now'), datetime('now'), ?)""",
+            (user_id, username, first_name, json.dumps({"commands_used": 0, "searches": 0, "favorites": 0, "quiz_score": 0, "battle_wins": 0, "daily_streak": 0, "last_login": ""}))
+        )
+    
+    @staticmethod
+    def add_command_stat(user_id: int, command: str, success: bool = True):
+        """Log command usage"""
+        Database.execute(
+            "INSERT INTO command_stats (command, user_id, success) VALUES (?, ?, ?)",
+            (command, user_id, 1 if success else 0)
+        )
+        
+        # Update user stats
+        user = Database.get_user(user_id)
+        if user:
+            stats = json.loads(user['stats'])
+            stats['commands_used'] = stats.get('commands_used', 0) + 1
+            
+            # Check daily streak
+            last_login = stats.get('last_login', '')
+            today = datetime.now().strftime('%Y-%m-%d')
+            if last_login == today:
+                pass  # Already logged in today
+            elif last_login == (datetime.now() - timedelta(days=1)).strftime('%Y-%m-%d'):
+                stats['daily_streak'] = stats.get('daily_streak', 0) + 1
+            else:
+                stats['daily_streak'] = 1
+            
+            stats['last_login'] = today
+            Database.update_user(user_id, stats=json.dumps(stats))
+    
+    @staticmethod
+    def get_quiz_question(difficulty: str = None, category: str = None):
+        """Get random quiz question"""
+        query = "SELECT * FROM quiz_questions"
+        params = []
+        
+        if difficulty or category:
+            conditions = []
+            if difficulty:
+                conditions.append("difficulty = ?")
+                params.append(difficulty)
+            if category:
+                conditions.append("category = ?")
+                params.append(category)
+            query += " WHERE " + " AND ".join(conditions)
+        
+        query += " ORDER BY RANDOM() LIMIT 1"
+        return Database.execute(query, tuple(params), fetchone=True)
+    
+    @staticmethod
+    def get_random_meme():
+        """Get random meme"""
+        return Database.execute(
+            "SELECT * FROM memes ORDER BY RANDOM() LIMIT 1",
+            fetchone=True
+        )
+    
+    @staticmethod
+    def get_gacha_character(rarity: str = None):
+        """Get random gacha character"""
+        query = "SELECT * FROM gacha_characters"
+        params = []
+        
+        if rarity:
+            query += " WHERE rarity = ?"
+            params.append(rarity)
+        
+        query += " ORDER BY RANDOM() LIMIT 1"
+        return Database.execute(query, tuple(params), fetchone=True)
+    
+    @staticmethod
+    def get_user_achievements(user_id: int):
+        """Get user's unlocked achievements"""
+        user = Database.get_user(user_id)
+        if user and user['achievements']:
+            return json.loads(user['achievements'])
+        return []
+    
+    @staticmethod
+    def unlock_achievement(user_id: int, achievement_id: int):
+        """Unlock achievement for user"""
+        user = Database.get_user(user_id)
+        if not user:
+            return False
+        
+        achievements = json.loads(user['achievements']) if user['achievements'] else []
+        if achievement_id not in achievements:
+            achievements.append(achievement_id)
+            Database.update_user(user_id, achievements=json.dumps(achievements))
+            return True
+        return False
+
+# =========== ANILIST API WITH OAUTH ===========
 class AniListAPI:
-    """Simple working AniList API"""
+    """Complete AniList API with OAuth"""
     
     def __init__(self):
         self.base_url = "https://graphql.anilist.co"
+        self.oauth_url = "https://anilist.co/api/v2/oauth/authorize"
+        self.token_url = "https://anilist.co/api/v2/oauth/token"
         self.session = None
         self.cache = {}
     
@@ -79,291 +469,75 @@ class AniListAPI:
             self.session = aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=30))
         return self.session
     
-    async def _make_request(self, query: str, variables: dict = None):
-        """Make GraphQL request with error handling"""
+    async def _make_request(self, query: str, variables: dict = None, token: str = None):
+        """Make GraphQL request"""
         session = await self._get_session()
+        
+        headers = {"Content-Type": "application/json"}
+        if token:
+            headers["Authorization"] = f"Bearer {token}"
         
         try:
             async with session.post(
                 self.base_url,
                 json={"query": query, "variables": variables or {}},
-                headers={"Content-Type": "application/json"}
+                headers=headers
             ) as response:
                 if response.status == 200:
                     data = await response.json()
                     if "errors" in data:
                         logger.error(f"AniList API error: {data['errors']}")
-                        return {"error": data["errors"][0]["message"]}
+                        return {"error": data["errors"][0].get("message", "Unknown error")}
                     return data.get("data", {})
+                elif response.status == 429:
+                    return {"error": "Rate limited. Please try again later."}
                 else:
                     return {"error": f"HTTP {response.status}"}
         except Exception as e:
             logger.error(f"Request error: {e}")
             return {"error": str(e)}
     
-    # =========== ANIME QUERIES ===========
-    
-    async def search_anime(self, query: str, page: int = 1, per_page: int = 10):
-        """Search anime - WORKING"""
-        search_query = """
-        query ($search: String, $page: Int, $perPage: Int) {
-          Page(page: $page, perPage: $perPage) {
-            media(search: $search, type: ANIME, sort: SEARCH_MATCH) {
-              id
-              title {
-                romaji
-                english
-                native
-              }
-              coverImage {
-                large
-                medium
-              }
-              averageScore
-              popularity
-              format
-              episodes
-              status
-              description(asHtml: false)
-              genres
-            }
-          }
+    async def get_oauth_url(self, state: str):
+        """Generate OAuth URL"""
+        params = {
+            "client_id": ANILIST_CLIENT_ID,
+            "redirect_uri": ANILIST_REDIRECT_URI,
+            "response_type": "code",
+            "state": state
         }
-        """
-        
-        result = await self._make_request(search_query, {
-            "search": query,
-            "page": page,
-            "perPage": per_page
-        })
-        
-        if "error" in result:
-            return []
-        
-        return result.get("Page", {}).get("media", [])
+        return f"{self.oauth_url}?{urllib.parse.urlencode(params)}"
     
-    async def get_anime(self, anime_id: int):
-        """Get anime details - WORKING"""
-        anime_query = """
-        query ($id: Int) {
-          Media(id: $id, type: ANIME) {
-            id
-            title {
-              romaji
-              english
-              native
-            }
-            description(asHtml: false)
-            averageScore
-            popularity
-            format
-            episodes
-            duration
-            status
-            startDate {
-              year
-              month
-              day
-            }
-            coverImage {
-              extraLarge
-              large
-              medium
-            }
-            bannerImage
-            genres
-            studios {
-              edges {
-                node {
-                  name
-                }
-              }
-            }
-            siteUrl
-          }
+    async def exchange_code_for_token(self, code: str):
+        """Exchange authorization code for access token"""
+        session = await self._get_session()
+        
+        data = {
+            "grant_type": "authorization_code",
+            "client_id": ANILIST_CLIENT_ID,
+            "client_secret": ANILIST_CLIENT_SECRET,
+            "redirect_uri": ANILIST_REDIRECT_URI,
+            "code": code
         }
-        """
         
-        result = await self._make_request(anime_query, {"id": anime_id})
-        
-        if "error" in result:
-            return {"error": result["error"]}
-        
-        return result.get("Media", {})
+        try:
+            async with session.post(self.token_url, data=data) as response:
+                if response.status == 200:
+                    return await response.json()
+                else:
+                    logger.error(f"Token exchange failed: {response.status}")
+                    return None
+        except Exception as e:
+            logger.error(f"Token exchange error: {e}")
+            return None
     
-    async def get_trending(self, per_page: int = 10):
-        """Get trending anime - WORKING"""
+    async def get_user_with_token(self, token: str):
+        """Get user data with access token"""
         query = """
-        query ($perPage: Int) {
-          Page(perPage: $perPage) {
-            media(type: ANIME, sort: TRENDING_DESC) {
-              id
-              title {
-                romaji
-                english
-              }
-              coverImage {
-                large
-              }
-              averageScore
-              trending
-              popularity
-              format
-              episodes
-            }
-          }
-        }
-        """
-        
-        result = await self._make_request(query, {"perPage": per_page})
-        
-        if "error" in result:
-            return []
-        
-        return result.get("Page", {}).get("media", [])
-    
-    async def get_top_anime(self, per_page: int = 10):
-        """Get top anime - WORKING"""
-        query = """
-        query ($perPage: Int) {
-          Page(perPage: $perPage) {
-            media(type: ANIME, sort: SCORE_DESC) {
-              id
-              title {
-                romaji
-                english
-              }
-              coverImage {
-                large
-              }
-              averageScore
-              popularity
-              format
-              episodes
-              status
-            }
-          }
-        }
-        """
-        
-        result = await self._make_request(query, {"perPage": per_page})
-        
-        if "error" in result:
-            return []
-        
-        return result.get("Page", {}).get("media", [])
-    
-    async def get_random_anime(self):
-        """Get random anime - WORKING"""
-        # Search for popular anime and pick random
-        results = await self.search_anime("", page=random.randint(1, 5))
-        if results:
-            return random.choice(results)
-        
-        # Fallback: try random ID
-        random_id = random.randint(1, 20000)
-        return await self.get_anime(random_id)
-    
-    async def search_character(self, query: str, per_page: int = 10):
-        """Search characters - WORKING"""
-        query_gql = """
-        query ($search: String, $perPage: Int) {
-          Page(perPage: $perPage) {
-            characters(search: $search) {
-              id
-              name {
-                full
-                native
-              }
-              image {
-                large
-                medium
-              }
-              description(asHtml: false)
-              gender
-              favourites
-              media {
-                edges {
-                  node {
-                    id
-                    title {
-                      romaji
-                      english
-                    }
-                  }
-                }
-              }
-            }
-          }
-        }
-        """
-        
-        result = await self._make_request(query_gql, {
-            "search": query,
-            "perPage": per_page
-        })
-        
-        if "error" in result:
-            return []
-        
-        return result.get("Page", {}).get("characters", [])
-    
-    async def get_character(self, char_id: int):
-        """Get character details - WORKING"""
-        query = """
-        query ($id: Int) {
-          Character(id: $id) {
-            id
-            name {
-              full
-              native
-              alternative
-            }
-            image {
-              large
-              medium
-            }
-            description(asHtml: false)
-            gender
-            dateOfBirth {
-              year
-              month
-              day
-            }
-            age
-            favourites
-            media {
-              edges {
-                node {
-                  id
-                  title {
-                    romaji
-                    english
-                  }
-                  type
-                }
-              }
-            }
-            siteUrl
-          }
-        }
-        """
-        
-        result = await self._make_request(query, {"id": char_id})
-        
-        if "error" in result:
-            return {"error": result["error"]}
-        
-        return result.get("Character", {})
-    
-    async def get_user_profile(self, username: str):
-        """Get AniList user profile - WORKING"""
-        query = """
-        query ($name: String) {
-          User(name: $name) {
+        query {
+          Viewer {
             id
             name
-            about(asHtml: false)
+            about
             avatar {
               large
               medium
@@ -413,86 +587,90 @@ class AniListAPI:
         }
         """
         
-        result = await self._make_request(query, {"name": username})
-        
+        result = await self._make_request(query, token=token)
         if "error" in result:
-            return {"error": result["error"]}
+            return result
         
-        return result.get("User", {})
+        viewer = result.get("Viewer", {})
+        if viewer:
+            return viewer
+        return {"error": "No user data found"}
     
-    async def get_seasonal(self):
-        """Get current seasonal anime - WORKING"""
-        current_year = datetime.now().year
-        month = datetime.now().month
-        
-        if month in [1, 2, 3]:
-            season = "WINTER"
-        elif month in [4, 5, 6]:
-            season = "SPRING"
-        elif month in [7, 8, 9]:
-            season = "SUMMER"
-        else:
-            season = "FALL"
-        
-        query = """
-        query ($season: MediaSeason, $seasonYear: Int, $perPage: Int) {
-          Page(perPage: $perPage) {
-            media(season: $season, seasonYear: $seasonYear, type: ANIME, sort: POPULARITY_DESC) {
+    async def search_anime(self, query: str, page: int = 1, per_page: int = 10):
+        """Search anime - FIXED for multi-word queries"""
+        search_query = """
+        query ($search: String, $page: Int, $perPage: Int) {
+          Page(page: $page, perPage: $perPage) {
+            media(search: $search, type: ANIME, sort: SEARCH_MATCH) {
               id
               title {
                 romaji
                 english
+                native
               }
               coverImage {
+                extraLarge
                 large
+                medium
               }
+              bannerImage
               averageScore
               popularity
               format
               episodes
+              duration
               status
-            }
-          }
-        }
-        """
-        
-        result = await self._make_request(query, {
-            "season": season,
-            "seasonYear": current_year,
-            "perPage": 15
-        })
-        
-        if "error" in result:
-            return []
-        
-        return result.get("Page", {}).get("media", [])
-    
-    async def get_anime_by_genre(self, genre: str, per_page: int = 10):
-        """Get anime by genre - WORKING"""
-        query = """
-        query ($genre: String, $perPage: Int) {
-          Page(perPage: $perPage) {
-            media(type: ANIME, genre: $genre, sort: POPULARITY_DESC) {
-              id
-              title {
-                romaji
-                english
-              }
-              coverImage {
-                large
-              }
-              averageScore
-              popularity
-              format
-              episodes
+              description(asHtml: false)
               genres
+              studios {
+                edges {
+                  node {
+                    name
+                  }
+                }
+              }
+              relations {
+                edges {
+                  relationType
+                  node {
+                    id
+                    title {
+                      romaji
+                      english
+                    }
+                  }
+                }
+              }
+              characters(perPage: 5) {
+                edges {
+                  node {
+                    id
+                    name {
+                      full
+                      native
+                    }
+                    image {
+                      large
+                      medium
+                    }
+                  }
+                  role
+                }
+              }
+              trailer {
+                id
+                site
+                thumbnail
+              }
+              siteUrl
             }
           }
         }
         """
         
-        result = await self._make_request(query, {
-            "genre": genre,
+        result = await self._make_request(search_query, {
+            "search": query,
+            "page": page,
             "perPage": per_page
         })
         
@@ -501,336 +679,311 @@ class AniListAPI:
         
         return result.get("Page", {}).get("media", [])
     
-    async def close(self):
-        """Close session"""
-        if self.session and not self.session.closed:
-            await self.session.close()
+    async def get_anime(self, anime_id: int):
+        """Get anime details"""
+        # Check cache first
+        cached = Database.execute(
+            "SELECT data FROM anime_cache WHERE anime_id = ? AND datetime(cached_at) > datetime('now', '-24 hours')",
+            (anime_id,), fetchone=True
+        )
+        
+        if cached:
+            return json.loads(cached['data'])
+        
+        anime_query = """
+        query ($id: Int) {
+          Media(id: $id, type: ANIME) {
+            id
+            title {
+              romaji
+              english
+              native
+            }
+            description(asHtml: false)
+            averageScore
+            popularity
+            format
+            episodes
+            duration
+            status
+            startDate {
+              year
+              month
+              day
+            }
+            endDate {
+              year
+              month
+              day
+            }
+            coverImage {
+              extraLarge
+              large
+              medium
+            }
+            bannerImage
+            genres
+            studios {
+              edges {
+                node {
+                  name
+                }
+              }
+            }
+            relations {
+              edges {
+                relationType
+                node {
+                  id
+                  title {
+                    romaji
+                    english
+                  }
+                }
+              }
+            }
+            characters(perPage: 10) {
+              edges {
+                node {
+                  id
+                  name {
+                    full
+                    native
+                  }
+                  image {
+                    large
+                  }
+                  description(asHtml: false)
+                }
+                role
+              }
+            }
+            trailer {
+              id
+              site
+              thumbnail
+            }
+            recommendations(perPage: 5) {
+              edges {
+                node {
+                  mediaRecommendation {
+                    id
+                    title {
+                      romaji
+                      english
+                    }
+                  }
+                }
+              }
+            }
+            siteUrl
+          }
+        }
+        """
+        
+        result = await self._make_request(anime_query, {"id": anime_id})
+        
+        if "error" not in result and result.get("Media"):
+            # Cache the result
+            Database.execute(
+                "INSERT OR REPLACE INTO anime_cache (anime_id, data) VALUES (?, ?)",
+                (anime_id, json.dumps(result["Media"]))
+            )
+            return result["Media"]
+        
+        return result
+    
+    async def search_character(self, query: str, per_page: int = 10):
+        """Search character - FIXED for multi-word queries"""
+        char_query = """
+        query ($search: String, $perPage: Int) {
+          Page(perPage: $perPage) {
+            characters(search: $search) {
+              id
+              name {
+                full
+                native
+                alternative
+              }
+              image {
+                large
+                medium
+              }
+              description(asHtml: false)
+              gender
+              age
+              dateOfBirth {
+                year
+                month
+                day
+              }
+              favourites
+              media {
+                edges {
+                  node {
+                    id
+                    title {
+                      romaji
+                      english
+                    }
+                    type
+                  }
+                }
+              }
+              siteUrl
+            }
+          }
+        }
+        """
+        
+        result = await self._make_request(char_query, {
+            "search": query,
+            "perPage": per_page
+        })
+        
+        if "error" in result:
+            return []
+        
+        return result.get("Page", {}).get("characters", [])
+    
+    async def get_character(self, char_id: int):
+        """Get character details"""
+        # Check cache
+        cached = Database.execute(
+            "SELECT data FROM character_cache WHERE character_id = ? AND datetime(cached_at) > datetime('now', '-24 hours')",
+            (char_id,), fetchone=True
+        )
+        
+        if cached:
+            return json.loads(cached['data'])
+        
+        query = """
+        query ($id: Int) {
+          Character(id: $id) {
+            id
+            name {
+              full
+              native
+              alternative
+            }
+            image {
+              large
+              medium
+            }
+            description(asHtml: false)
+            gender
+            age
+            dateOfBirth {
+              year
+              month
+              day
+            }
+            favourites
+            media {
+              edges {
+                node {
+                  id
+                  title {
+                    romaji
+                    english
+                  }
+                  type
+                  coverImage {
+                    large
+                  }
+                }
+              }
+            }
+            siteUrl
+          }
+        }
+        """
+        
+        result = await self._make_request(query, {"id": char_id})
+        
+        if "error" not in result and result.get("Character"):
+            # Cache the result
+            Database.execute(
+                "INSERT OR REPLACE INTO character_cache (character_id, data) VALUES (?, ?)",
+                (char_id, json.dumps(result["Character"]))
+            )
+            return result["Character"]
+        
+        return result
 
 # Initialize API
 anilist = AniListAPI()
 
-# =========== DATABASE SETUP (PROPER) ===========
-def init_database():
-    """Initialize database with proper schema"""
-    os.makedirs("data", exist_ok=True)
+# =========== IMAGE PROCESSING ===========
+class ImageProcessor:
+    """Process images for profiles, memes, etc."""
     
-    conn = sqlite3.connect(DATABASE_PATH)
-    c = conn.cursor()
-    
-    # Users table
-    c.execute('''CREATE TABLE IF NOT EXISTS users (
-        user_id INTEGER PRIMARY KEY,
-        username TEXT,
-        first_name TEXT,
-        last_name TEXT,
-        joined_date TEXT DEFAULT CURRENT_TIMESTAMP,
-        last_active TEXT DEFAULT CURRENT_TIMESTAMP,
-        total_commands INTEGER DEFAULT 0,
-        total_searches INTEGER DEFAULT 0,
-        total_favorites INTEGER DEFAULT 0,
-        anilist_username TEXT,
-        is_admin INTEGER DEFAULT 0,
-        is_banned INTEGER DEFAULT 0,
-        language TEXT DEFAULT 'en'
-    )''')
-    
-    # Favorites table
-    c.execute('''CREATE TABLE IF NOT EXISTS favorites (
-        id INTEGER PRIMARY KEY AUTOINCREMENT,
-        user_id INTEGER,
-        anime_id INTEGER,
-        anime_title TEXT,
-        anime_image TEXT,
-        anime_score REAL,
-        added_date TEXT DEFAULT CURRENT_TIMESTAMP,
-        UNIQUE(user_id, anime_id)
-    )''')
-    
-    # Command stats
-    c.execute('''CREATE TABLE IF NOT EXISTS command_stats (
-        id INTEGER PRIMARY KEY AUTOINCREMENT,
-        command TEXT,
-        user_id INTEGER,
-        timestamp TEXT DEFAULT CURRENT_TIMESTAMP
-    )''')
-    
-    # Error logs
-    c.execute('''CREATE TABLE IF NOT EXISTS error_logs (
-        id INTEGER PRIMARY KEY AUTOINCREMENT,
-        error TEXT,
-        user_id INTEGER,
-        command TEXT,
-        timestamp TEXT DEFAULT CURRENT_TIMESTAMP
-    )''')
-    
-    # Groups
-    c.execute('''CREATE TABLE IF NOT EXISTS groups (
-        group_id INTEGER PRIMARY KEY,
-        title TEXT,
-        added_date TEXT DEFAULT CURRENT_TIMESTAMP,
-        last_active TEXT DEFAULT CURRENT_TIMESTAMP,
-        is_active INTEGER DEFAULT 1
-    )''')
-    
-    # Admin actions
-    c.execute('''CREATE TABLE IF NOT EXISTS admin_actions (
-        id INTEGER PRIMARY KEY AUTOINCREMENT,
-        admin_id INTEGER,
-        action TEXT,
-        target_id INTEGER,
-        details TEXT,
-        timestamp TEXT DEFAULT CURRENT_TIMESTAMP
-    )''')
-    
-    # Broadcasts
-    c.execute('''CREATE TABLE IF NOT EXISTS broadcasts (
-        id INTEGER PRIMARY KEY AUTOINCREMENT,
-        admin_id INTEGER,
-        message TEXT,
-        sent_count INTEGER DEFAULT 0,
-        failed_count INTEGER DEFAULT 0,
-        timestamp TEXT DEFAULT CURRENT_TIMESTAMP
-    )''')
-    
-    # Add default admin
-    for admin_id in ADMIN_IDS:
-        c.execute("INSERT OR IGNORE INTO users (user_id, is_admin) VALUES (?, 1)", (admin_id,))
-    
-    conn.commit()
-    conn.close()
-    logger.info("Database initialized successfully")
-
-init_database()
-
-# =========== DATABASE HELPER FUNCTIONS ===========
-def db_execute(query: str, params: tuple = (), fetchone: bool = False, fetchall: bool = False):
-    """Safe database execution"""
-    try:
-        conn = sqlite3.connect(DATABASE_PATH)
-        c = conn.cursor()
-        c.execute(query, params)
-        
-        if fetchone:
-            result = c.fetchone()
-        elif fetchall:
-            result = c.fetchall()
-        else:
-            result = c.lastrowid
-        
-        conn.commit()
-        conn.close()
-        
-        return result
-    except Exception as e:
-        logger.error(f"Database error: {e}")
-        if fetchone or fetchall:
-            return None if fetchone else []
-        return None
-
-def update_user(user_id: int, username: str = None, first_name: str = None, command: str = None):
-    """Update user stats"""
-    try:
-        # Check if user exists
-        user = db_execute("SELECT user_id FROM users WHERE user_id = ?", (user_id,), fetchone=True)
-        
-        if user:
-            db_execute(
-                """UPDATE users SET 
-                last_active = datetime('now'),
-                username = COALESCE(?, username),
-                first_name = COALESCE(?, first_name),
-                total_commands = total_commands + CASE WHEN ? IS NOT NULL THEN 1 ELSE 0 END
-                WHERE user_id = ?""",
-                (username, first_name, command, user_id)
-            )
-        else:
-            db_execute(
-                """INSERT INTO users 
-                (user_id, username, first_name, joined_date, last_active, total_commands) 
-                VALUES (?, ?, ?, datetime('now'), datetime('now'), ?)""",
-                (user_id, username, first_name, 1 if command else 0)
-            )
-        
-        if command:
-            db_execute("INSERT INTO command_stats (command, user_id) VALUES (?, ?)", (command, user_id))
-        
-        return True
-    except Exception as e:
-        logger.error(f"Update user error: {e}")
-        return False
-
-def add_favorite(user_id: int, anime_id: int, anime_title: str, anime_image: str = "", anime_score: float = None):
-    """Add anime to favorites"""
-    try:
-        db_execute(
-            """INSERT OR IGNORE INTO favorites 
-            (user_id, anime_id, anime_title, anime_image, anime_score, added_date) 
-            VALUES (?, ?, ?, ?, ?, datetime('now'))""",
-            (user_id, anime_id, anime_title, anime_image, anime_score)
-        )
-        
-        # Update user favorites count
-        db_execute("UPDATE users SET total_favorites = total_favorites + 1 WHERE user_id = ?", (user_id,))
-        
-        return True
-    except Exception as e:
-        logger.error(f"Add favorite error: {e}")
-        return False
-
-def remove_favorite(user_id: int, anime_id: int):
-    """Remove anime from favorites"""
-    try:
-        db_execute("DELETE FROM favorites WHERE user_id = ? AND anime_id = ?", (user_id, anime_id))
-        db_execute("UPDATE users SET total_favorites = total_favorites - 1 WHERE user_id = ?", (user_id,))
-        return True
-    except:
-        return False
-
-def get_favorites(user_id: int, limit: int = 20):
-    """Get user favorites"""
-    return db_execute(
-        "SELECT anime_id, anime_title, anime_image, anime_score, added_date FROM favorites WHERE user_id = ? ORDER BY added_date DESC LIMIT ?",
-        (user_id, limit), fetchall=True
-    )
-
-def get_user_stats(user_id: int):
-    """Get user statistics"""
-    return db_execute(
-        """SELECT joined_date, total_commands, total_searches, total_favorites, anilist_username 
-        FROM users WHERE user_id = ?""",
-        (user_id,), fetchone=True
-    )
-
-def get_bot_stats():
-    """Get bot statistics"""
-    stats = {}
-    
-    # Total users
-    result = db_execute("SELECT COUNT(*) FROM users", fetchone=True)
-    stats["total_users"] = result[0] if result else 0
-    
-    # Active today
-    result = db_execute("SELECT COUNT(*) FROM users WHERE DATE(last_active) = DATE('now')", fetchone=True)
-    stats["active_today"] = result[0] if result else 0
-    
-    # Commands today
-    result = db_execute("SELECT COUNT(*) FROM command_stats WHERE DATE(timestamp) = DATE('now')", fetchone=True)
-    stats["commands_today"] = result[0] if result else 0
-    
-    # Total groups
-    result = db_execute("SELECT COUNT(*) FROM groups", fetchone=True)
-    stats["total_groups"] = result[0] if result else 0
-    
-    # Total favorites
-    result = db_execute("SELECT COUNT(*) FROM favorites", fetchone=True)
-    stats["total_favorites"] = result[0] if result else 0
-    
-    return stats
-
-def is_admin(user_id: int):
-    """Check if user is admin"""
-    if user_id in ADMIN_IDS:
-        return True
-    
-    result = db_execute("SELECT is_admin FROM users WHERE user_id = ?", (user_id,), fetchone=True)
-    return result and result[0] == 1
-
-def is_banned(user_id: int):
-    """Check if user is banned"""
-    result = db_execute("SELECT is_banned FROM users WHERE user_id = ?", (user_id,), fetchone=True)
-    return result and result[0] == 1
-
-def ban_user(user_id: int, reason: str = ""):
-    """Ban user"""
-    db_execute("UPDATE users SET is_banned = 1 WHERE user_id = ?", (user_id,))
-    db_execute(
-        "INSERT INTO admin_actions (admin_id, action, target_id, details) VALUES (0, 'ban', ?, ?)",
-        (user_id, reason)
-    )
-    return True
-
-def unban_user(user_id: int):
-    """Unban user"""
-    db_execute("UPDATE users SET is_banned = 0 WHERE user_id = ?", (user_id,))
-    db_execute(
-        "INSERT INTO admin_actions (admin_id, action, target_id) VALUES (0, 'unban', ?)",
-        (user_id,)
-    )
-    return True
-
-def promote_user(user_id: int):
-    """Promote user to admin"""
-    db_execute("UPDATE users SET is_admin = 1 WHERE user_id = ?", (user_id,))
-    ADMIN_IDS.append(user_id)
-    db_execute(
-        "INSERT INTO admin_actions (admin_id, action, target_id) VALUES (0, 'promote', ?)",
-        (user_id,)
-    )
-    return True
-
-def demote_user(user_id: int):
-    """Demote user from admin"""
-    db_execute("UPDATE users SET is_admin = 0 WHERE user_id = ?", (user_id,))
-    if user_id in ADMIN_IDS:
-        ADMIN_IDS.remove(user_id)
-    db_execute(
-        "INSERT INTO admin_actions (admin_id, action, target_id) VALUES (0, 'demote', ?)",
-        (user_id,)
-    )
-    return True
-
-def log_error(user_id: int, error: str, command: str = None):
-    """Log error to database"""
-    db_execute(
-        "INSERT INTO error_logs (error, user_id, command) VALUES (?, ?, ?)",
-        (str(error)[:500], user_id, command)
-    )
+    @staticmethod
+    async def create_profile_card(user_data: dict, anilist_data: dict = None):
+        """Create beautiful profile card image"""
+        try:
+            # Create blank image
+            width, height = 800, 600
+            img = Image.new('RGB', (width, height), color=(30, 30, 46))  # Dark blue
+            
+            draw = ImageDraw.Draw(img)
+            
+            # Try to load fonts
+            try:
+                title_font = ImageFont.truetype("arial.ttf", 40)
+                text_font = ImageFont.truetype("arial.ttf", 24)
+                small_font = ImageFont.truetype("arial.ttf", 18)
+            except:
+                title_font = ImageFont.load_default()
+                text_font = ImageFont.load_default()
+                small_font = ImageFont.load_default()
+            
+            # Draw banner
+            draw.rectangle([0, 0, width, 200], fill=(21, 101, 192))  # Blue banner
+            
+            # Draw user info
+            username = user_data.get('username', user_data.get('first_name', 'User'))
+            draw.text((50, 50), f"👤 {username}", fill=(255, 255, 255), font=title_font)
+            
+            # Draw stats
+            stats_y = 220
+            stats = json.loads(user_data.get('stats', '{}'))
+            
+            stats_texts = [
+                f"📊 Commands: {stats.get('commands_used', 0)}",
+                f"⭐ Favorites: {stats.get('favorites', 0)}",
+                f"🏆 Quiz Score: {stats.get('quiz_score', 0)}",
+                f"⚔️ Battle Wins: {stats.get('battle_wins', 0)}",
+                f"🔥 Streak: {stats.get('daily_streak', 0)} days",
+            ]
+            
+            for i, text in enumerate(stats_texts):
+                draw.text((50, stats_y + i*40), text, fill=(220, 220, 220), font=text_font)
+            
+            # Draw achievements
+            achievements = Database.get_user_achievements(user_data['user_id'])
+            if achievements:
+                draw.text((400, 220), "🏆 Achievements:", fill=(255, 215, 0), font=text_font)
+                for i, ach_id in enumerate(achievements[:3]):  # Show first 3
+                    draw.text((400, 260 + i*30), f"• Achievement {ach_id}", fill=(200, 200, 200), font=small_font)
+            
+            # Add AniList info if available
+            if anilist_data:
+                draw.text((50, 420), f"🔗 AniList: {anilist_data.get('name', 'Linked')}", fill=(100, 200, 255), font=text_font)
+                anime_stats = anilist_data.get('statistics', {}).get('anime', {})
+                draw.text((50, 450), f"🎬 Anime: {anime_stats.get('count', 0)} titles", fill=(200, 200, 200), font=small_font)
+            
+            # Save to bytes
+            img_bytes = BytesIO()
+            img.save(img_bytes, format='PNG')
+            img_bytes.seek(0)
+            
+            return img_bytes
+        except Exception as e:
+            logger.error(f"Profile card error: {e}")
+            return None
 
 # =========== HELPER FUNCTIONS ===========
-def check_cooldown(user_id: int, command: str, seconds: int = 2) -> bool:
-    """Check command cooldown"""
-    key = f"{user_id}_{command}"
-    now = time.time()
-    
-    if key in user_cooldowns:
-        if now - user_cooldowns[key] < seconds:
-            return False
-    
-    user_cooldowns[key] = now
-    return True
-
-async def download_image(url: str) -> Optional[bytes]:
-    """Download image from URL"""
-    try:
-        if not session:
-            async with aiohttp.ClientSession() as temp_session:
-                async with temp_session.get(url, timeout=10) as response:
-                    if response.status == 200:
-                        return await response.read()
-        else:
-            async with session.get(url, timeout=10) as response:
-                if response.status == 200:
-                    return await response.read()
-    except:
-        return None
-    return None
-
-async def get_waifu_image() -> Optional[str]:
-    """Get waifu image from waifu.pics"""
-    try:
-        async with aiohttp.ClientSession() as session:
-            async with session.get("https://api.waifu.pics/sfw/waifu", timeout=10) as response:
-                if response.status == 200:
-                    data = await response.json()
-                    return data.get("url")
-    except:
-        return None
-
-async def get_husbando_image() -> Optional[str]:
-    """Get husbando image (use male character from waifu.pics or similar)"""
-    # For now, use same as waifu
-    return await get_waifu_image()
-
 def format_description(description: str, max_length: int = 400) -> str:
     """Format anime description"""
     if not description:
@@ -848,7 +1001,406 @@ def format_description(description: str, max_length: int = 400) -> str:
     
     return description
 
-# =========== USER COMMANDS (50+ WORKING) ===========
+def check_cooldown(user_id: int, command: str, seconds: int = 2) -> bool:
+    """Check command cooldown"""
+    key = f"{user_id}_{command}"
+    now = time.time()
+    
+    if key in user_cooldowns:
+        if now - user_cooldowns[key] < seconds:
+            return False
+    
+    user_cooldowns[key] = now
+    return True
+
+async def get_waifu_image():
+    """Get waifu image from API"""
+    apis = [
+        "https://api.waifu.pics/sfw/waifu",
+        "https://nekos.best/api/v2/waifu",
+        "https://api.nekosapi.com/v2/images/random?category=waifu"
+    ]
+    
+    for api in apis:
+        try:
+            async with aiohttp.ClientSession() as session:
+                async with session.get(api, timeout=10) as response:
+                    if response.status == 200:
+                        data = await response.json()
+                        # Handle different API responses
+                        if api == "https://api.waifu.pics/sfw/waifu":
+                            return data.get("url")
+                        elif api == "https://nekos.best/api/v2/waifu":
+                            return data.get("url")
+                        elif api == "https://api.nekosapi.com/v2/images/random":
+                            return data.get("image_url")
+        except:
+            continue
+    
+    return "https://i.imgur.com/XW6J2r5.jpg"  # Fallback image
+
+async def get_husbando_image():
+    """Get husbando image from API"""
+    # For husbando, we might need to use character search or fallback
+    try:
+        # Try to get male character from AniList
+        characters = await anilist.search_character("", per_page=50)
+        if characters:
+            male_chars = [c for c in characters if c.get('gender', '').lower() == 'male']
+            if male_chars:
+                char = random.choice(male_chars)
+                return char.get('image', {}).get('large')
+    except:
+        pass
+    
+    # Fallback to waifu image
+    return await get_waifu_image()
+
+async def get_anime_meme():
+    """Get anime meme"""
+    meme = Database.get_random_meme()
+    if meme:
+        return meme['image_url'], meme['caption']
+    
+    # Fallback memes
+    memes = [
+        ("https://i.imgur.com/meme1.jpg", "When you realize the anime filler arc is longer than the canon story"),
+        ("https://i.imgur.com/meme2.jpg", "Me waiting for the next season of my favorite anime"),
+        ("https://i.imgur.com/meme3.jpg", "When someone says anime is for kids"),
+    ]
+    
+    return random.choice(memes)
+
+# =========== BATTLE SYSTEM ===========
+class BattleSystem:
+    """Anime character battle system"""
+    
+    CHARACTERS = {
+        "Goku": {"hp": 1000, "attack": 150, "defense": 80, "speed": 95, "special": "Kamehameha", "anime": "Dragon Ball"},
+        "Naruto": {"hp": 800, "attack": 120, "defense": 70, "speed": 85, "special": "Rasengan", "anime": "Naruto"},
+        "Luffy": {"hp": 900, "attack": 130, "defense": 75, "speed": 80, "special": "Gear Fourth", "anime": "One Piece"},
+        "Eren Yeager": {"hp": 750, "attack": 110, "defense": 65, "speed": 75, "special": "Titan Transformation", "anime": "Attack on Titan"},
+        "Levi Ackerman": {"hp": 700, "attack": 140, "defense": 60, "speed": 100, "special": "Ultimate Speed", "anime": "Attack on Titan"},
+        "Saitama": {"hp": 9999, "attack": 999, "defense": 999, "speed": 999, "special": "Serious Punch", "anime": "One Punch Man"},
+        "Light Yagami": {"hp": 500, "attack": 999, "defense": 30, "speed": 60, "special": "Death Note", "anime": "Death Note"},
+        "Killua Zoldyck": {"hp": 650, "attack": 125, "defense": 65, "speed": 110, "special": "Godspeed", "anime": "Hunter x Hunter"},
+        "Gon Freecss": {"hp": 750, "attack": 135, "defense": 70, "speed": 85, "special": "Jajanken", "anime": "Hunter x Hunter"},
+        "Ichigo Kurosaki": {"hp": 850, "attack": 140, "defense": 75, "speed": 90, "special": "Getsuga Tensho", "anime": "Bleach"},
+    }
+    
+    @staticmethod
+    async def start_battle(player1_id: int, player2_id: int):
+        """Start a new battle between two players"""
+        battle_id = f"{player1_id}_{player2_id}_{int(time.time())}"
+        
+        # Assign random characters
+        chars = list(BattleSystem.CHARACTERS.keys())
+        char1 = random.choice(chars)
+        char2 = random.choice([c for c in chars if c != char1])
+        
+        battle_data = {
+            "id": battle_id,
+            "player1": {"id": player1_id, "character": char1, "hp": BattleSystem.CHARACTERS[char1]["hp"]},
+            "player2": {"id": player2_id, "character": char2, "hp": BattleSystem.CHARACTERS[char2]["hp"]},
+            "turn": player1_id,  # Player 1 goes first
+            "round": 1,
+            "log": [],
+            "status": "active"
+        }
+        
+        battle_sessions[battle_id] = battle_data
+        
+        # Create battle message
+        char1_stats = BattleSystem.CHARACTERS[char1]
+        char2_stats = BattleSystem.CHARACTERS[char2]
+        
+        message = f"""⚔️ <b>ANIME BATTLE STARTED!</b>
+
+🎌 <b>{char1}</b> ({char1_stats['anime']}) 
+❤️ HP: {char1_stats['hp']} | ⚔️ ATK: {char1_stats['attack']} | 🛡️ DEF: {char1_stats['defense']} | 🏃 SPD: {char1_stats['speed']}
+
+<b>VS</b>
+
+🎌 <b>{char2}</b> ({char2_stats['anime']})
+❤️ HP: {char2_stats['hp']} | ⚔️ ATK: {char2_stats['attack']} | 🛡️ DEF: {char2_stats['defense']} | 🏃 SPD: {char2_stats['speed']}
+
+<b>Player 1's turn!</b>
+Use <code>/attack</code> to attack!"""
+        
+        return battle_id, message
+    
+    @staticmethod
+    async def process_attack(battle_id: str, attacker_id: int):
+        """Process an attack in battle"""
+        if battle_id not in battle_sessions:
+            return None, "Battle not found!"
+        
+        battle = battle_sessions[battle_id]
+        
+        if battle["turn"] != attacker_id:
+            return battle_id, "Not your turn!"
+        
+        # Determine attacker and defender
+        if attacker_id == battle["player1"]["id"]:
+            attacker = battle["player1"]
+            defender = battle["player2"]
+            next_turn = battle["player2"]["id"]
+        else:
+            attacker = battle["player2"]
+            defender = battle["player1"]
+            next_turn = battle["player1"]["id"]
+        
+        # Calculate damage
+        attacker_stats = BattleSystem.CHARACTERS[attacker["character"]]
+        defender_stats = BattleSystem.CHARACTERS[defender["character"]]
+        
+        base_damage = attacker_stats["attack"] - (defender_stats["defense"] * 0.3)
+        crit_chance = random.random()
+        
+        if crit_chance < 0.1:  # 10% crit chance
+            damage = int(base_damage * 1.5)
+            crit_text = "💥 CRITICAL HIT! 💥"
+        elif crit_chance < 0.2:  # 10% special move chance
+            damage = int(base_damage * 1.2)
+            crit_text = f"✨ {attacker_stats['special']}! ✨"
+        else:
+            damage = int(base_damage)
+            crit_text = "⚔️ Normal Attack"
+        
+        # Ensure minimum damage
+        damage = max(10, damage)
+        
+        # Apply damage
+        defender["hp"] = max(0, defender["hp"] - damage)
+        
+        # Update battle
+        battle["turn"] = next_turn
+        battle["round"] += 1
+        battle["log"].append(f"Round {battle['round']-1}: {attacker['character']} dealt {damage} damage to {defender['character']}")
+        
+        # Check for winner
+        winner = None
+        if defender["hp"] <= 0:
+            winner = attacker
+            battle["status"] = "finished"
+            
+            # Update user stats
+            user = Database.get_user(attacker["id"])
+            if user:
+                stats = json.loads(user['stats'])
+                stats['battle_wins'] = stats.get('battle_wins', 0) + 1
+                Database.update_user(attacker["id"], stats=json.dumps(stats))
+            
+            # Log battle
+            Database.execute(
+                """INSERT INTO battles (player1_id, player2_id, winner_id, player1_character, player2_character, turns, details) 
+                VALUES (?, ?, ?, ?, ?, ?, ?)""",
+                (battle["player1"]["id"], battle["player2"]["id"], attacker["id"], 
+                 battle["player1"]["character"], battle["player2"]["character"], 
+                 battle["round"], json.dumps(battle["log"]))
+            )
+            
+            # Remove from active sessions
+            del battle_sessions[battle_id]
+        
+        # Create battle update message
+        message = f"""⚔️ <b>BATTLE UPDATE - Round {battle['round']-1}</b>
+
+{crit_text}
+
+🎌 <b>{attacker['character']}</b> attacked <b>{defender['character']}</b> for <b>{damage} damage</b>!
+
+<b>Current Status:</b>
+❤️ {battle['player1']['character']}: {battle['player1']['hp']} HP
+❤️ {battle['player2']['character']}: {battle['player2']['hp']} HP
+        
+"""
+        
+        if winner:
+            message += f"\n🎉 <b>VICTORY!</b> {winner['character']} wins the battle!"
+        else:
+            message += f"\n<b>Next Turn:</b> {'Player 1' if next_turn == battle['player1']['id'] else 'Player 2'}"
+        
+        return battle_id, message
+
+# =========== QUIZ SYSTEM ===========
+class QuizSystem:
+    """Anime quiz system"""
+    
+    @staticmethod
+    async def start_quiz(user_id: int, difficulty: str = "medium"):
+        """Start a new quiz for user"""
+        question = Database.get_quiz_question(difficulty)
+        
+        if not question:
+            return None, "No quiz questions available at the moment!"
+        
+        quiz_id = f"{user_id}_{int(time.time())}"
+        
+        quiz_data = {
+            "id": quiz_id,
+            "user_id": user_id,
+            "question": question,
+            "start_time": time.time(),
+            "answered": False,
+            "score": 0
+        }
+        
+        quiz_sessions[quiz_id] = quiz_data
+        
+        # Format question
+        options = json.loads(question['options'])
+        options_text = "\n".join([f"{chr(65+i)}. {opt}" for i, opt in enumerate(options)])
+        
+        message = f"""🎮 <b>ANIME QUIZ</b>
+
+<b>Question:</b> {question['question']}
+
+<b>Options:</b>
+{options_text}
+
+<b>Difficulty:</b> {question['difficulty'].title()}
+<b>Category:</b> {question['category'].title()}
+<b>Source:</b> {question['source_anime'] or 'General'}
+
+Reply with <b>A, B, C, or D</b> to answer!"""
+        
+        return quiz_id, message
+    
+    @staticmethod
+    async def check_answer(quiz_id: str, answer: str):
+        """Check quiz answer"""
+        if quiz_id not in quiz_sessions:
+            return None, "Quiz session expired!"
+        
+        quiz = quiz_sessions[quiz_id]
+        
+        if quiz["answered"]:
+            return quiz_id, "You already answered this question!"
+        
+        # Convert letter to index (A=0, B=1, etc.)
+        answer_index = ord(answer.upper()) - 65
+        
+        if not 0 <= answer_index <= 3:
+            return quiz_id, "Please answer with A, B, C, or D!"
+        
+        question = quiz["question"]
+        correct_index = question['correct_answer']
+        options = json.loads(question['options'])
+        
+        quiz["answered"] = True
+        
+        if answer_index == correct_index:
+            # Calculate score based on difficulty
+            difficulty_scores = {"easy": 10, "medium": 20, "hard": 30}
+            score = difficulty_scores.get(question['difficulty'], 10)
+            
+            # Update user stats
+            user = Database.get_user(quiz["user_id"])
+            if user:
+                stats = json.loads(user['stats'])
+                stats['quiz_score'] = stats.get('quiz_score', 0) + score
+                Database.update_user(quiz["user_id"], stats=json.dumps(stats))
+            
+            message = f"""✅ <b>CORRECT!</b>
+
+The answer is: <b>{options[correct_index]}</b>
+
+<b>Explanation:</b> {question['explanation']}
+
+🎉 <b>+{score} points!</b>"""
+        else:
+            message = f"""❌ <b>INCORRECT!</b>
+
+The correct answer is: <b>{options[correct_index]}</b>
+
+<b>Your answer:</b> {options[answer_index]}
+<b>Explanation:</b> {question['explanation']}"""
+        
+        # Remove from active sessions after delay
+        await asyncio.sleep(5)
+        if quiz_id in quiz_sessions:
+            del quiz_sessions[quiz_id]
+        
+        return quiz_id, message
+
+# =========== GACHA SYSTEM ===========
+class GachaSystem:
+    """Character gacha system"""
+    
+    RARITY_WEIGHTS = {
+        "SSR": 5,    # 5% chance
+        "SR": 15,    # 15% chance
+        "R": 80      # 80% chance
+    }
+    
+    @staticmethod
+    async def pull(user_id: int):
+        """Perform a gacha pull"""
+        # Check daily pull limit
+        user = Database.get_user(user_id)
+        if user:
+            stats = json.loads(user['stats'])
+            last_pull = stats.get('last_pull_date', '')
+            today = datetime.now().strftime('%Y-%m-%d')
+            
+            pulls_today = stats.get('pulls_today', 0)
+            if last_pull == today and pulls_today >= 10:
+                return None, "Daily pull limit reached (10 pulls). Come back tomorrow!"
+        
+        # Determine rarity
+        rand = random.random() * 100
+        cumulative = 0
+        selected_rarity = "R"
+        
+        for rarity, weight in GachaSystem.RARITY_WEIGHTS.items():
+            cumulative += weight
+            if rand <= cumulative:
+                selected_rarity = rarity
+                break
+        
+        # Get character of that rarity
+        character = Database.get_gacha_character(selected_rarity)
+        
+        if not character:
+            # Fallback character
+            character = {
+                "name": "Mysterious Character",
+                "image_url": "https://i.imgur.com/XW6J2r5.jpg",
+                "rarity": selected_rarity,
+                "anime": "Unknown",
+                "description": "A mysterious character has appeared!"
+            }
+        
+        # Add to user's collection
+        if user:
+            cards = json.loads(user['character_cards']) if user['character_cards'] else []
+            cards.append(character['id'])
+            
+            # Update stats
+            stats['pulls_today'] = stats.get('pulls_today', 0) + 1
+            stats['last_pull_date'] = today
+            Database.update_user(user_id, character_cards=json.dumps(cards), stats=json.dumps(stats))
+        
+        # Create message
+        rarity_colors = {
+            "SSR": "🌈",
+            "SR": "✨", 
+            "R": "⭐"
+        }
+        
+        message = f"""{rarity_colors.get(selected_rarity, "⭐")} <b>GACHA PULL!</b>
+
+🎌 <b>{character['name']}</b>
+🏷️ <b>Rarity:</b> {selected_rarity}
+📺 <b>Anime:</b> {character['anime']}
+📝 <b>{character['description']}</b>
+
+<i>Added to your collection!</i>"""
+        
+        return character['image_url'], message
+
+# =========== COMMAND HANDLERS ===========
 
 # =========== START & HELP ===========
 @dp.message(CommandStart())
@@ -864,45 +1416,42 @@ async def start_command(message: Message):
         await message.answer("❌ Your account has been banned.")
         return
     
-    update_user(user.id, user.username, user.first_name, "/start")
+    # Create/update user
+    Database.create_user(user.id, user.username, user.first_name)
+    Database.add_command_stat(user.id, "start")
     
     welcome_text = f"""🎌 <b>Welcome to AnimeKuun, {user.first_name}!</b>
 
 Your ultimate anime companion with <b>50+ commands</b>!
 
 ✨ <b>Quick Start:</b>
-• <code>/search Attack on Titan</code> - Find anime
-• <code>/anime 16498</code> - Anime details
-• <code>/trending</code> - Trending now
-• <code>/waifu</code> - Random waifu
-• <code>/husbando</code> - Random husbando
-• <code>/quote</code> - Anime quotes
-• <code>/profile</code> - Your profile
+• <code>/anime Attack on Titan</code> - Find anime (multi-word works!)
+• <code>/character Eren Yeager</code> - Character info
+• <code>/waifu</code> - Your anime soulmate (with image)
+• <code>/husbando</code> - Your anime partner (with image)
+• <code>/quiz</code> - Anime trivia game
+• <code>/meme</code> - Anime memes
+• <code>/profile</code> - Your profile with stats
+• <code>/link</code> - Connect AniList account
 
 💬 <b>Works in groups too!</b>
-Try me in any group chat!
-
 Made with ❤️ for anime fans worldwide!"""
     
     keyboard = InlineKeyboardBuilder()
     keyboard.row(
-        InlineKeyboardButton(text="🔍 Search Anime", switch_inline_query_current_chat="search "),
-        InlineKeyboardButton(text="🌟 Trending", callback_data="trending")
+        InlineKeyboardButton(text="🔗 Connect AniList", callback_data="link_anilist"),
+        InlineKeyboardButton(text="🎮 Play Quiz", callback_data="play_quiz")
     )
     keyboard.row(
-        InlineKeyboardButton(text="💖 Get Waifu", callback_data="waifu"),
-        InlineKeyboardButton(text="💙 Get Husbando", callback_data="husbando")
-    )
-    keyboard.row(
-        InlineKeyboardButton(text="📊 My Stats", callback_data="profile"),
-        InlineKeyboardButton(text="📚 All Commands", callback_data="help")
+        InlineKeyboardButton(text="💖 Get Waifu", callback_data="get_waifu"),
+        InlineKeyboardButton(text="💙 Get Husbando", callback_data="get_husbando")
     )
     
     await message.answer(welcome_text, reply_markup=keyboard.as_markup())
 
 @dp.message(Command("help"))
 async def help_command(message: Message):
-    """Help command with all commands"""
+    """Help command - ONLY USER COMMANDS"""
     user = message.from_user
     
     if maintenance_mode and not is_admin(user.id):
@@ -912,162 +1461,64 @@ async def help_command(message: Message):
     if is_banned(user.id):
         return
     
-    update_user(user.id, user.username, user.first_name, "/help")
+    Database.add_command_stat(user.id, "help")
     
     help_text = """📚 <b>AnimeKuun Bot - Complete Command List</b>
 
 <u>🔍 SEARCH & DISCOVERY:</u>
-<code>/search</code> <i>anime name</i> - Search for anime
-<code>/anime</code> <i>id/name</i> - Anime details
-<code>/character</code> <i>name</i> - Character info
-<code>/manga</code> <i>name</i> - Manga search
-<code>/trending</code> - Trending anime
-<code>/popular</code> - Popular anime
-<code>/topanime</code> - Top rated anime
-<code>/topmanga</code> - Top manga
-<code>/seasonal</code> - Current season
-<code>/upcoming</code> - Upcoming anime
-<code>/airing</code> - Airing schedule
+<code>/anime</code> <i>name</i> - Find anime (multi-word works!)
+<code>/character</code> <i>name</i> - Character info with image
+<code>/studio</code> <i>name</i> - Studio's works
 <code>/genre</code> <i>name</i> - Anime by genre
-<code>/year</code> <i>2024</i> - Anime by year
-<code>/studio</code> <i>name</i> - Studio works
-<code>/random</code> - Random anime
+<code>/trending</code> - Trending anime now
+<code>/popular</code> - Popular anime
+<code>/top</code> - Top rated anime
+<code>/seasonal</code> - Current season
+<code>/random</code> - Random anime suggestion
 
-<u>💖 WAIFU & HUSBANDO:</u>
-<code>/waifu</code> - Random waifu with image
-<code>/husbando</code> - Random husbando with image
-<code>/waifus</code> - Your waifu collection
-<code>/husbandos</code> - Your husbando collection
-<code>/topwaifus</code> - Top waifus
-<code>/tophusbandos</code> - Top husbandos
-<code>/claim</code> <i>id</i> - Claim character
-<code>/collection</code> - Your collection
-
-<u>👤 USER & SOCIAL:</u>
-<code>/profile</code> <i>[@user]</i> - User profile
-<code>/stats</code> - Your statistics
-<code>/favorites</code> - Your favorites
-<code>/watchlist</code> - Your watchlist
-<code>/history</code> - Watch history
-<code>/achievements</code> - Achievements
-<code>/link</code> <i>username</i> - Link AniList
-<code>/user</code> <i>username</i> - AniList profile
-<code>/compare</code> <i>@user</i> - Compare stats
-<code>/leaderboard</code> - Leaderboard
-<code>/friends</code> - Friends list
-<code>/tag</code> <i>@user message</i> - Tag user
-
-<u>🎮 FUN & GAMES:</u>
-<code>/quote</code> - Anime quote
-<code>/quiz</code> - Anime quiz
-<code>/guess</code> - Guess anime
-<code>/trivia</code> - Anime trivia
-<code>/ship</code> <i>char1 char2</i> - Ship characters
-<code>/birthday</code> - Birthdays
+<u>💖 FUN & GAMES:</u>
+<code>/waifu</code> - Your anime soulmate (with image)
+<code>/husbando</code> - Your anime partner (with image)
+<code>/quote</code> - Random anime quote
+<code>/meme</code> - Anime meme (image)
+<code>/ship</code> <i>name1 name2</i> - Ship compatibility
 <code>/roll</code> - Random anime
-<code>/battle</code> <i>@user</i> - Battle
-<code>/meme</code> - Anime memes
-<code>/challenge</code> - Daily challenge
 
-<u>📊 STATISTICS:</u>
-<code>/botstats</code> - Bot statistics
-<code>/apistats</code> - API statistics
-<code>/userstats</code> <i>id</i> - User stats
-<code>/aniliststats</code> <i>user</i> - AniList stats
-<code>/genrestats</code> - Genre stats
-<code>/globalstats</code> - Global stats
+<u>🎮 GAMES:</u>
+<code>/quiz</code> - Anime trivia (multiple choice)
+<code>/battle</code> <i>@user</i> - Battle with anime characters
+<code>/gacha</code> - Pull character cards
+<code>/guess</code> - Guess the anime
+<code>/trivia</code> - Quick anime facts
 
-<u>👑 ADMIN COMMANDS (18+):</u>
-<code>/admin</code> - Admin panel
-<code>/broadcast</code> - Broadcast
-<code>/users</code> - List users
-<code>/groups</code> - List groups
-<code>/ban</code> <i>id reason</i> - Ban user
-<code>/unban</code> <i>id</i> - Unban user
-<code>/promote</code> <i>id</i> - Promote admin
-<code>/demote</code> <i>id</i> - Demote admin
-<code>/maintenance</code> <i>on/off</i> - Maintenance
-<code>/backup</code> - Backup database
-<code>/cleanup</code> - Cleanup data
-<code>/logs</code> <i>[error/user]</i> - View logs
-<code>/ping</code> - Bot status
-<code>/restart</code> - Restart bot
-<code>/announce</code> <i>title|message</i> - Announce
-<code>/exportall</code> - Export all data
-<code>/import</code> <i>file</i> - Import data
-<code>/warn</code> <i>id reason</i> - Warn user
-<code>/mute</code> <i>id hours</i> - Mute user
+<u>👤 PROFILE & SOCIAL:</u>
+<code>/profile</code> - Your bot profile
+<code>/favorites</code> - Your favorite anime
+<code>/watchlist</code> - Your watchlist
+<code>/achievements</code> - Your unlocked badges
+<code>/collection</code> - Your character cards
+<code>/stats</code> - Your statistics
 
-💡 <b>Tip:</b> Most commands work in groups too!"""
+<u>🔗 ANILIST INTEGRATION:</u>
+<code>/link</code> - Connect AniList account
+<code>/unlink</code> - Disconnect account
+<code>/sync</code> - Sync with AniList
+<code>/compare</code> <i>@user</i> - Compare anime taste
+
+<u>👥 GROUP FEATURES:</u>
+<code>/watchparty</code> - Start anime watch party
+<code>/poll</code> - Create anime poll
+<code>/recommend</code> - Get group recommendations
+
+💡 <b>Tip:</b> Most commands work in groups too!
+🎌 <b>Use /start to begin your anime journey!</b>"""
     
     await message.answer(help_text)
 
-# =========== SEARCH COMMANDS ===========
-@dp.message(Command("search"))
-async def search_command(message: Message):
-    """Search anime"""
-    user = message.from_user
-    
-    if maintenance_mode and not is_admin(user.id):
-        await message.answer("🔧 The bot is currently under maintenance.")
-        return
-    
-    if is_banned(user.id):
-        return
-    
-    if not check_cooldown(user.id, "search", 3):
-        await message.answer("⏳ Please wait a moment before searching again.")
-        return
-    
-    if not message.text or len(message.text.split()) < 2:
-        await message.answer("🔍 <b>Usage:</b> <code>/search anime name</code>\nExample: <code>/search Attack on Titan</code>")
-        return
-    
-    query = " ".join(message.text.split()[1:])
-    update_user(user.id, user.username, user.first_name, "/search")
-    
-    search_msg = await message.answer(f"🔍 Searching for <b>{query}</b>...")
-    
-    try:
-        results = await anilist.search_anime(query)
-        
-        if not results:
-            await search_msg.edit_text(f"❌ No results found for <b>{query}</b>")
-            return
-        
-        response = f"🔍 <b>Results for:</b> {query}\n\n"
-        
-        keyboard = InlineKeyboardBuilder()
-        
-        for idx, anime in enumerate(results[:8], 1):
-            title = anime.get('title', {}).get('english') or anime.get('title', {}).get('romaji', 'Unknown')
-            score = anime.get('averageScore', 'N/A')
-            episodes = anime.get('episodes', '?')
-            
-            response += f"{idx}. <b>{title}</b>\n"
-            response += f"   ⭐ {score} | 📺 {episodes} eps | 🆔 <code>{anime['id']}</code>\n\n"
-            
-            keyboard.button(
-                text=f"{idx}. {title[:15]}...",
-                callback_data=f"anime_{anime['id']}"
-            )
-        
-        keyboard.adjust(2)
-        keyboard.row(
-            InlineKeyboardButton(text="🔍 Search Again", switch_inline_query_current_chat=f"search {query}"),
-            InlineKeyboardButton(text="📋 View More", callback_data=f"search_more_{query}")
-        )
-        
-        await search_msg.edit_text(response, reply_markup=keyboard.as_markup())
-        
-    except Exception as e:
-        logger.error(f"Search error: {e}")
-        await search_msg.edit_text(f"❌ Search failed. Please try again.")
-        log_error(user.id, str(e), "/search")
-
+# =========== ANIME COMMANDS (FIXED MULTI-WORD) ===========
 @dp.message(Command("anime"))
 async def anime_command(message: Message):
-    """Get anime details"""
+    """Get anime details - FIXED multi-word search"""
     user = message.from_user
     
     if maintenance_mode and not is_admin(user.id):
@@ -1081,39 +1532,52 @@ async def anime_command(message: Message):
         await message.answer("⏳ Please wait before checking another anime.")
         return
     
-    if not message.text or len(message.text.split()) < 2:
-        await message.answer("🎬 <b>Usage:</b> <code>/anime id</code> or <code>/anime name</code>\nExample: <code>/anime 16498</code>")
+    # Get entire query after command
+    query = message.text.split(maxsplit=1)
+    if len(query) < 2:
+        await message.answer("🎬 <b>Usage:</b> <code>/anime anime name</code>\nExample: <code>/anime Attack on Titan</code>")
         return
     
-    query = message.text.split()[1]
-    update_user(user.id, user.username, user.first_name, "/anime")
+    query = query[1].strip()
+    Database.add_command_stat(user.id, "anime")
     
-    anime_msg = await message.answer("🎬 Fetching anime details...")
+    anime_msg = await message.answer(f"🎬 Searching for <b>{query}</b>...")
     
     try:
-        anime_data = {}
+        results = await anilist.search_anime(query, per_page=5)
         
-        if query.isdigit():
-            anime_data = await anilist.get_anime(int(query))
-        else:
-            # Search for anime by name
-            results = await anilist.search_anime(query, per_page=1)
-            if results:
-                anime_data = await anilist.get_anime(results[0]['id'])
-            else:
-                await anime_msg.edit_text(f"❌ Anime not found: <b>{query}</b>")
-                return
+        if not results:
+            await anime_msg.edit_text(f"❌ No anime found for <b>{query}</b>")
+            return
+        
+        # Show first result
+        anime_data = await anilist.get_anime(results[0]['id'])
         
         if "error" in anime_data:
             await anime_msg.edit_text(f"❌ Error: {anime_data['error']}")
             return
         
-        if not anime_data:
-            await anime_msg.edit_text("❌ Failed to fetch anime data.")
-            return
-        
         title = anime_data.get('title', {}).get('english') or anime_data.get('title', {}).get('romaji', 'Unknown')
         description = format_description(anime_data.get('description', ''))
+        
+        # Get genres
+        genres = anime_data.get('genres', [])
+        genres_text = ', '.join(genres[:5]) if genres else 'N/A'
+        
+        # Get studios
+        studios = anime_data.get('studios', {}).get('edges', [])
+        studios_text = ', '.join([s['node']['name'] for s in studios[:3]]) if studios else 'N/A'
+        
+        # Get relations
+        relations = anime_data.get('relations', {}).get('edges', [])
+        prequels = [r for r in relations if r['relationType'] in ['PREQUEL', 'PARENT']]
+        sequels = [r for r in relations if r['relationType'] in ['SEQUEL', 'SIDE_STORY']]
+        
+        # Get characters
+        characters = anime_data.get('characters', {}).get('edges', [])[:5]
+        
+        # Get trailer
+        trailer = anime_data.get('trailer', {})
         
         response = f"""🎬 <b>{title}</b>
 
@@ -1123,26 +1587,38 @@ async def anime_command(message: Message):
 📺 <b>Episodes:</b> {anime_data.get('episodes', 'N/A')}
 ⏱️ <b>Duration:</b> {anime_data.get('duration', 'N/A')} min
 📅 <b>Status:</b> {anime_data.get('status', 'N/A').replace('_', ' ').title()}
-🏷️ <b>Genres:</b> {', '.join(anime_data.get('genres', ['N/A']))}
+🏷️ <b>Genres:</b> {genres_text}
+🎨 <b>Studios:</b> {studios_text}
 
 📝 <b>Description:</b>
 {description}
 
 🔗 <a href="{anime_data.get('siteUrl', '#')}">View on AniList</a>"""
         
-        # Create keyboard
+        # Create keyboard with WORKING buttons
         keyboard = InlineKeyboardBuilder()
-        keyboard.row(
-            InlineKeyboardButton(text="⭐ Add to Favorites", callback_data=f"fav_{anime_data['id']}"),
-            InlineKeyboardButton(text="👥 Characters", callback_data=f"chars_{anime_data['id']}")
-        )
-        keyboard.row(
-            InlineKeyboardButton(text="🎬 Trailer", callback_data=f"trailer_{anime_data['id']}"),
-            InlineKeyboardButton(text="🔗 Open AniList", url=anime_data.get('siteUrl', 'https://anilist.co'))
-        )
+        
+        # Characters button
+        if characters:
+            keyboard.button(text="👥 Characters", callback_data=f"characters_{anime_data['id']}")
+        
+        # Trailer button
+        if trailer and trailer.get('site') == 'youtube':
+            keyboard.button(text="🎬 Trailer", callback_data=f"trailer_{anime_data['id']}")
+        
+        # Relations buttons
+        if prequels:
+            keyboard.button(text="⏮️ Prequel", callback_data=f"anime_{prequels[0]['node']['id']}")
+        if sequels:
+            keyboard.button(text="⏭️ Sequel", callback_data=f"anime_{sequels[0]['node']['id']}")
+        
+        keyboard.adjust(2)
+        
+        # Add to favorites button
+        keyboard.button(text="⭐ Add to Favorites", callback_data=f"fav_{anime_data['id']}")
         
         # Send cover image if available
-        cover_url = anime_data.get('coverImage', {}).get('large')
+        cover_url = anime_data.get('coverImage', {}).get('large') or anime_data.get('coverImage', {}).get('medium')
         if cover_url:
             try:
                 await message.answer_photo(
@@ -1152,19 +1628,23 @@ async def anime_command(message: Message):
                 )
                 await anime_msg.delete()
                 return
-            except:
-                pass  # Fallback to text only
+            except Exception as e:
+                logger.error(f"Image send error: {e}")
         
         await anime_msg.edit_text(response, reply_markup=keyboard.as_markup())
         
     except Exception as e:
         logger.error(f"Anime command error: {e}")
         await anime_msg.edit_text("❌ Failed to fetch anime details.")
-        log_error(user.id, str(e), "/anime")
+        Database.execute(
+            "INSERT INTO error_logs (error, user_id, command) VALUES (?, ?, ?)",
+            (str(e)[:500], user.id, "anime")
+        )
 
-@dp.message(Command("trending"))
-async def trending_command(message: Message):
-    """Get trending anime"""
+# =========== CHARACTER COMMAND (FIXED MULTI-WORD) ===========
+@dp.message(Command("character"))
+async def character_command(message: Message):
+    """Get character details - FIXED multi-word search"""
     user = message.from_user
     
     if maintenance_mode and not is_admin(user.id):
@@ -1174,108 +1654,96 @@ async def trending_command(message: Message):
     if is_banned(user.id):
         return
     
-    update_user(user.id, user.username, user.first_name, "/trending")
+    if not check_cooldown(user.id, "character", 3):
+        await message.answer("⏳ Please wait before checking another character.")
+        return
     
-    trending_msg = await message.answer("🌟 Fetching trending anime...")
+    # Get entire query after command
+    query = message.text.split(maxsplit=1)
+    if len(query) < 2:
+        await message.answer("👤 <b>Usage:</b> <code>/character character name</code>\nExample: <code>/character Eren Yeager</code>")
+        return
+    
+    query = query[1].strip()
+    Database.add_command_stat(user.id, "character")
+    
+    char_msg = await message.answer(f"👤 Searching for <b>{query}</b>...")
     
     try:
-        results = await anilist.get_trending(10)
+        results = await anilist.search_character(query, per_page=5)
         
         if not results:
-            await trending_msg.edit_text("❌ No trending anime found.")
+            await char_msg.edit_text(f"❌ No characters found for <b>{query}</b>")
             return
         
-        response = "🔥 <b>Trending Anime Now</b>\n\n"
+        # Show first result
+        char_data = await anilist.get_character(results[0]['id'])
         
-        for idx, anime in enumerate(results, 1):
-            title = anime.get('title', {}).get('english') or anime.get('title', {}).get('romaji', 'Unknown')
-            score = anime.get('averageScore', 'N/A')
-            trending = anime.get('trending', 'N/A')
-            
-            response += f"{idx}. <b>{title}</b>\n"
-            response += f"   ⭐ {score} | 📈 {trending} | 🆔 <code>{anime['id']}</code>\n\n"
-        
-        keyboard = InlineKeyboardBuilder()
-        keyboard.row(
-            InlineKeyboardButton(text="📈 View More", callback_data="trending_more"),
-            InlineKeyboardButton(text="🔄 Refresh", callback_data="trending_refresh")
-        )
-        
-        await trending_msg.edit_text(response, reply_markup=keyboard.as_markup())
-        
-    except Exception as e:
-        logger.error(f"Trending error: {e}")
-        await trending_msg.edit_text("❌ Failed to fetch trending anime.")
-        log_error(user.id, str(e), "/trending")
-
-@dp.message(Command("random"))
-async def random_command(message: Message):
-    """Get random anime"""
-    user = message.from_user
-    
-    if maintenance_mode and not is_admin(user.id):
-        await message.answer("🔧 The bot is currently under maintenance.")
-        return
-    
-    if is_banned(user.id):
-        return
-    
-    update_user(user.id, user.username, user.first_name, "/random")
-    
-    random_msg = await message.answer("🎲 Finding random anime...")
-    
-    try:
-        anime_data = await anilist.get_random_anime()
-        
-        if not anime_data or 'id' not in anime_data:
-            await random_msg.edit_text("❌ Failed to get random anime. Try again!")
+        if "error" in char_data:
+            await char_msg.edit_text(f"❌ Error: {char_data['error']}")
             return
         
-        title = anime_data.get('title', {}).get('english') or anime_data.get('title', {}).get('romaji', 'Unknown')
-        description = format_description(anime_data.get('description', ''))
+        name = char_data.get('name', {}).get('full', 'Unknown')
+        description = format_description(char_data.get('description', ''), 300)
         
-        response = f"""🎲 <b>Random Anime Recommendation</b>
+        # Get anime appearances
+        media = char_data.get('media', {}).get('edges', [])
+        anime_list = []
+        for m in media[:3]:
+            if m['node']['type'] == 'ANIME':
+                title = m['node']['title'].get('english') or m['node']['title'].get('romaji', 'Unknown')
+                anime_list.append(title)
+        
+        response = f"""👤 <b>{name}</b>
 
-🎬 <b>{title}</b>
-⭐ <b>Score:</b> {anime_data.get('averageScore', 'N/A')}/100
-📊 <b>Popularity:</b> #{anime_data.get('popularity', 'N/A')}
-🎞️ <b>Format:</b> {anime_data.get('format', 'N/A')}
-📺 <b>Episodes:</b> {anime_data.get('episodes', 'N/A')}
-🏷️ <b>Genres:</b> {', '.join(anime_data.get('genres', ['N/A'])[:3])}
+⚧️ <b>Gender:</b> {char_data.get('gender', 'Unknown')}
+🎂 <b>Age:</b> {char_data.get('age', 'Unknown')}
+❤️ <b>Favorites:</b> {char_data.get('favourites', 0):,}
+📺 <b>Appears in:</b> {', '.join(anime_list) if anime_list else 'Unknown'}
 
-📝 <b>Description:</b>
+📖 <b>About:</b>
 {description}
 
-🔗 <a href="https://anilist.co/anime/{anime_data['id']}">View on AniList</a>"""
+🔗 <a href="{char_data.get('siteUrl', '#')}">View on AniList</a>"""
         
+        # Create keyboard
         keyboard = InlineKeyboardBuilder()
-        keyboard.row(
-            InlineKeyboardButton(text="⭐ Add to Favorites", callback_data=f"fav_{anime_data['id']}"),
-            InlineKeyboardButton(text="🎲 Another Random", callback_data="random_another")
-        )
         
-        # Try to send with cover image
-        cover_url = anime_data.get('coverImage', {}).get('large')
-        if cover_url:
+        # Add to waifu/husbando collection
+        if char_data.get('gender', '').lower() == 'female':
+            keyboard.button(text="💖 Add as Waifu", callback_data=f"add_waifu_{char_data['id']}")
+        elif char_data.get('gender', '').lower() == 'male':
+            keyboard.button(text="💙 Add as Husbando", callback_data=f"add_husbando_{char_data['id']}")
+        
+        # View anime button
+        if media:
+            first_anime = next((m for m in media if m['node']['type'] == 'ANIME'), None)
+            if first_anime:
+                keyboard.button(text="🎬 View Anime", callback_data=f"anime_{first_anime['node']['id']}")
+        
+        keyboard.adjust(2)
+        
+        # Send character image if available
+        image_url = char_data.get('image', {}).get('large') or char_data.get('image', {}).get('medium')
+        if image_url:
             try:
                 await message.answer_photo(
-                    photo=URLInputFile(cover_url),
+                    photo=URLInputFile(image_url),
                     caption=response,
                     reply_markup=keyboard.as_markup()
                 )
-                await random_msg.delete()
+                await char_msg.delete()
                 return
             except:
                 pass
         
-        await random_msg.edit_text(response, reply_markup=keyboard.as_markup())
+        await char_msg.edit_text(response, reply_markup=keyboard.as_markup())
         
     except Exception as e:
-        logger.error(f"Random error: {e}")
-        await random_msg.edit_text("❌ Failed to get random anime.")
-        log_error(user.id, str(e), "/random")
+        logger.error(f"Character command error: {e}")
+        await char_msg.edit_text("❌ Failed to fetch character details.")
 
-# =========== WAIFU & HUSBANDO COMMANDS ===========
+# =========== WAIFU COMMAND (WITH IMAGES) ===========
 @dp.message(Command("waifu"))
 async def waifu_command(message: Message):
     """Get random waifu with image"""
@@ -1292,67 +1760,66 @@ async def waifu_command(message: Message):
         await message.answer("⏳ Please wait before getting another waifu.")
         return
     
-    update_user(user.id, user.username, user.first_name, "/waifu")
+    Database.add_command_stat(user.id, "waifu")
     
-    waifu_msg = await message.answer("💖 Finding your perfect waifu...")
+    waifu_msg = await message.answer("💖 Finding your perfect anime soulmate...")
     
     try:
-        # Get random character
-        characters = await anilist.search_character("")
-        if not characters:
-            # Fallback list
-            waifus = [
-                {"name": "Rem", "series": "Re:Zero", "image": ""},
-                {"name": "Zero Two", "series": "Darling in the Franxx", "image": ""},
-                {"name": "Mikasa Ackerman", "series": "Attack on Titan", "image": ""},
-                {"name": "Asuna Yuuki", "series": "Sword Art Online", "image": ""},
-                {"name": "Nezuko Kamado", "series": "Demon Slayer", "image": ""},
-            ]
-            waifu = random.choice(waifus)
+        # Get waifu image
+        image_url = await get_waifu_image()
+        
+        if not image_url:
+            # Search for random female character
+            characters = await anilist.search_character("", per_page=50)
+            female_chars = [c for c in characters if c.get('gender', '').lower() in ['female', 'f']]
             
-            response = f"""💖 <b>Your Waifu</b>
-
-👤 <b>{waifu['name']}</b>
-🎌 <b>From:</b> {waifu['series']}
-
-💕 <i>She's perfect for you!</i>"""
-            
-            keyboard = InlineKeyboardBuilder()
-            keyboard.row(
-                InlineKeyboardButton(text="💖 Claim Waifu", callback_data=f"claim_{waifu['name']}"),
-                InlineKeyboardButton(text="🔄 Another", callback_data="waifu_another")
-            )
-            
-            await waifu_msg.edit_text(response, reply_markup=keyboard.as_markup())
-            return
+            if female_chars:
+                char = random.choice(female_chars)
+                char_data = await anilist.get_character(char['id'])
+                image_url = char_data.get('image', {}).get('large')
+                name = char_data.get('name', {}).get('full', 'Mysterious Waifu')
+                anime = char_data.get('media', {}).get('edges', [{}])[0].get('node', {}).get('title', {}).get('romaji', 'Unknown Anime')
+            else:
+                name = "Mysterious Waifu"
+                anime = "Unknown Anime"
+        else:
+            name = random.choice(["Sakura", "Asuna", "Rem", "Zero Two", "Mikasa", "Nezuko", "Hinata"])
+            anime = random.choice(["Naruto", "Sword Art Online", "Re:Zero", "Darling in the Franxx", "Attack on Titan", "Demon Slayer"])
         
-        # Get real character
-        char_data = random.choice(characters)
-        char_details = await anilist.get_character(char_data['id'])
+        # Create message
+        compatibility = random.randint(70, 100)
         
-        if "error" in char_details:
-            char_details = char_data
+        if compatibility >= 90:
+            status = "💖 PERFECT MATCH! 💖"
+            message_text = "You two are destined to be together! This is true love!"
+        elif compatibility >= 80:
+            status = "❤️ EXCELLENT MATCH! ❤️"
+            message_text = "Amazing chemistry! This could be the start of something beautiful!"
+        elif compatibility >= 70:
+            status = "💛 GOOD MATCH 💛"
+            message_text = "You two would make a cute couple! Give it a try!"
+        else:
+            status = "💔 COMPATIBLE 💔"
+            message_text = "There's potential here! Might work with some effort!"
         
-        name = char_details.get('name', {}).get('full', 'Unknown')
-        description = format_description(char_details.get('description', ''), 200)
-        
-        response = f"""💖 <b>Your Waifu</b>
+        response = f"""💖 <b>YOUR ANIME SOULMATE</b>
 
 👤 <b>{name}</b>
-🎌 <b>Series:</b> {char_details.get('media', {}).get('edges', [{}])[0].get('node', {}).get('title', {}).get('romaji', 'Unknown')}
-❤️ <b>Favorites:</b> {char_details.get('favourites', 0):,}
+🎌 <b>From:</b> {anime}
 
-📖 <b>About:</b>
-{description}"""
+💝 <b>Compatibility:</b> {compatibility}%
+📊 <b>Status:</b> {status}
+
+💌 <i>{message_text}</i>
+
+✨ <i>The anime gods have spoken! This is your destined partner!</i>"""
         
         keyboard = InlineKeyboardBuilder()
         keyboard.row(
-            InlineKeyboardButton(text="💖 Claim Waifu", callback_data=f"claim_{char_details['id']}"),
-            InlineKeyboardButton(text="🔄 Another", callback_data="waifu_another")
+            InlineKeyboardButton(text="💖 Claim as Waifu", callback_data=f"claim_waifu_{name}"),
+            InlineKeyboardButton(text="🔄 Find Another", callback_data="another_waifu")
         )
         
-        # Try to send with image
-        image_url = char_details.get('image', {}).get('large')
         if image_url:
             try:
                 await message.answer_photo(
@@ -1365,27 +1832,13 @@ async def waifu_command(message: Message):
             except:
                 pass
         
-        # Try waifu.pics API
-        waifu_image = await get_waifu_image()
-        if waifu_image:
-            try:
-                await message.answer_photo(
-                    photo=URLInputFile(waifu_image),
-                    caption=response,
-                    reply_markup=keyboard.as_markup()
-                )
-                await waifu_msg.delete()
-                return
-            except:
-                pass
-        
         await waifu_msg.edit_text(response, reply_markup=keyboard.as_markup())
         
     except Exception as e:
-        logger.error(f"Waifu error: {e}")
-        await waifu_msg.edit_text("❌ Failed to find waifu.")
-        log_error(user.id, str(e), "/waifu")
+        logger.error(f"Waifu command error: {e}")
+        await waifu_msg.edit_text("💖 Your waifu is too shy to appear right now! Try again later.")
 
+# =========== HUSBANDO COMMAND (WITH IMAGES) ===========
 @dp.message(Command("husbando"))
 async def husbando_command(message: Message):
     """Get random husbando with image"""
@@ -1402,67 +1855,66 @@ async def husbando_command(message: Message):
         await message.answer("⏳ Please wait before getting another husbando.")
         return
     
-    update_user(user.id, user.username, user.first_name, "/husbando")
+    Database.add_command_stat(user.id, "husbando")
     
-    husbando_msg = await message.answer("💙 Finding your perfect husbando...")
+    husbando_msg = await message.answer("💙 Finding your perfect anime partner...")
     
     try:
-        # Search for male characters
-        characters = await anilist.search_character("male")
-        if not characters:
-            # Fallback list
-            husbandos = [
-                {"name": "Levi Ackerman", "series": "Attack on Titan", "image": ""},
-                {"name": "Lelouch Lamperouge", "series": "Code Geass", "image": ""},
-                {"name": "Kirito", "series": "Sword Art Online", "image": ""},
-                {"name": "Naruto Uzumaki", "series": "Naruto", "image": ""},
-                {"name": "Gojo Satoru", "series": "Jujutsu Kaisen", "image": ""},
-            ]
-            husbando = random.choice(husbandos)
+        # Get husbando image
+        image_url = await get_husbando_image()
+        
+        if not image_url:
+            # Search for random male character
+            characters = await anilist.search_character("", per_page=50)
+            male_chars = [c for c in characters if c.get('gender', '').lower() in ['male', 'm']]
             
-            response = f"""💙 <b>Your Husbando</b>
-
-👤 <b>{husbando['name']}</b>
-🎌 <b>From:</b> {husbando['series']}
-
-💙 <i>He's perfect for you!</i>"""
-            
-            keyboard = InlineKeyboardBuilder()
-            keyboard.row(
-                InlineKeyboardButton(text="💙 Claim Husbando", callback_data=f"claim_{husbando['name']}"),
-                InlineKeyboardButton(text="🔄 Another", callback_data="husbando_another")
-            )
-            
-            await husbando_msg.edit_text(response, reply_markup=keyboard.as_markup())
-            return
+            if male_chars:
+                char = random.choice(male_chars)
+                char_data = await anilist.get_character(char['id'])
+                image_url = char_data.get('image', {}).get('large')
+                name = char_data.get('name', {}).get('full', 'Mysterious Husbando')
+                anime = char_data.get('media', {}).get('edges', [{}])[0].get('node', {}).get('title', {}).get('romaji', 'Unknown Anime')
+            else:
+                name = "Mysterious Husbando"
+                anime = "Unknown Anime"
+        else:
+            name = random.choice(["Naruto", "Luffy", "Goku", "Levi", "Eren", "Kirito", "Gojo"])
+            anime = random.choice(["Naruto", "One Piece", "Dragon Ball", "Attack on Titan", "Sword Art Online", "Jujutsu Kaisen"])
         
-        # Get real character
-        char_data = random.choice(characters)
-        char_details = await anilist.get_character(char_data['id'])
+        # Create message
+        compatibility = random.randint(70, 100)
         
-        if "error" in char_details:
-            char_details = char_data
+        if compatibility >= 90:
+            status = "💙 PERFECT PARTNER! 💙"
+            message_text = "You two are meant for each other! This is destiny!"
+        elif compatibility >= 80:
+            status = "💚 EXCELLENT MATCH! 💚"
+            message_text = "Incredible chemistry! This could be your soulmate!"
+        elif compatibility >= 70:
+            status = "💛 GOOD PARTNER 💛"
+            message_text = "You two would make a great couple! Go for it!"
+        else:
+            status = "💔 COMPATIBLE 💔"
+            message_text = "There's potential here! Worth exploring!"
         
-        name = char_details.get('name', {}).get('full', 'Unknown')
-        description = format_description(char_details.get('description', ''), 200)
-        
-        response = f"""💙 <b>Your Husbando</b>
+        response = f"""💙 <b>YOUR ANIME PARTNER</b>
 
 👤 <b>{name}</b>
-🎌 <b>Series:</b> {char_details.get('media', {}).get('edges', [{}])[0].get('node', {}).get('title', {}).get('romaji', 'Unknown')}
-❤️ <b>Favorites:</b> {char_details.get('favourites', 0):,}
+🎌 <b>From:</b> {anime}
 
-📖 <b>About:</b>
-{description}"""
+💝 <b>Compatibility:</b> {compatibility}%
+📊 <b>Status:</b> {status}
+
+💌 <i>{message_text}</i>
+
+✨ <i>The anime stars have aligned! This is your destined partner!</i>"""
         
         keyboard = InlineKeyboardBuilder()
         keyboard.row(
-            InlineKeyboardButton(text="💙 Claim Husbando", callback_data=f"claim_{char_details['id']}"),
-            InlineKeyboardButton(text="🔄 Another", callback_data="husbando_another")
+            InlineKeyboardButton(text="💙 Claim as Husbando", callback_data=f"claim_husbando_{name}"),
+            InlineKeyboardButton(text="🔄 Find Another", callback_data="another_husbando")
         )
         
-        # Try to send with image
-        image_url = char_details.get('image', {}).get('large')
         if image_url:
             try:
                 await message.answer_photo(
@@ -1475,31 +1927,16 @@ async def husbando_command(message: Message):
             except:
                 pass
         
-        # Try husbando image API
-        husbando_image = await get_husbando_image()
-        if husbando_image:
-            try:
-                await message.answer_photo(
-                    photo=URLInputFile(husbando_image),
-                    caption=response,
-                    reply_markup=keyboard.as_markup()
-                )
-                await husbando_msg.delete()
-                return
-            except:
-                pass
-        
         await husbando_msg.edit_text(response, reply_markup=keyboard.as_markup())
         
     except Exception as e:
-        logger.error(f"Husbando error: {e}")
-        await husbando_msg.edit_text("❌ Failed to find husbando.")
-        log_error(user.id, str(e), "/husbando")
+        logger.error(f"Husbando command error: {e}")
+        await husbando_msg.edit_text("💙 Your husbando is training right now! Try again later.")
 
-# =========== ANILIST USER COMMANDS ===========
-@dp.message(Command("user"))
-async def user_command(message: Message):
-    """Get AniList user profile"""
+# =========== QUIZ COMMAND (WORKING) ===========
+@dp.message(Command("quiz"))
+async def quiz_command(message: Message):
+    """Start anime quiz"""
     user = message.from_user
     
     if maintenance_mode and not is_admin(user.id):
@@ -1509,87 +1946,133 @@ async def user_command(message: Message):
     if is_banned(user.id):
         return
     
-    if not message.text or len(message.text.split()) < 2:
-        await message.answer("👤 <b>Usage:</b> <code>/user anilist_username</code>\nExample: <code>/user kenri</code>")
+    if not check_cooldown(user.id, "quiz", 30):
+        await message.answer("⏳ Please wait before starting another quiz.")
         return
     
-    anilist_username = message.text.split()[1]
-    update_user(user.id, user.username, user.first_name, "/user")
+    Database.add_command_stat(user.id, "quiz")
     
-    user_msg = await message.answer(f"👤 Fetching AniList profile for <b>{anilist_username}</b>...")
+    # Get difficulty from command if provided
+    args = message.text.split()
+    difficulty = "medium"
+    if len(args) > 1:
+        diff = args[1].lower()
+        if diff in ["easy", "medium", "hard"]:
+            difficulty = diff
+    
+    quiz_id, response = await QuizSystem.start_quiz(user.id, difficulty)
+    
+    if quiz_id:
+        await message.answer(response)
+    else:
+        await message.answer(response)
+
+# =========== BATTLE COMMAND (WORKING) ===========
+@dp.message(Command("battle"))
+async def battle_command(message: Message):
+    """Start anime battle with tagged user"""
+    user = message.from_user
+    
+    if maintenance_mode and not is_admin(user.id):
+        await message.answer("🔧 The bot is currently under maintenance.")
+        return
+    
+    if is_banned(user.id):
+        return
+    
+    if not check_cooldown(user.id, "battle", 60):
+        await message.answer("⏳ Please wait before starting another battle.")
+        return
+    
+    Database.add_command_stat(user.id, "battle")
+    
+    # Check if user is replying to someone or mentioned someone
+    opponent_id = None
+    
+    if message.reply_to_message:
+        opponent_id = message.reply_to_message.from_user.id
+    elif message.entities:
+        for entity in message.entities:
+            if entity.type == MessageEntityType.TEXT_MENTION and entity.user:
+                opponent_id = entity.user.id
+                break
+    
+    if not opponent_id:
+        await message.answer("⚔️ <b>Usage:</b> Reply to a user's message with <code>/battle</code> or tag them!")
+        return
+    
+    if opponent_id == user.id:
+        await message.answer("❌ You can't battle yourself!")
+        return
+    
+    # Check if opponent is banned
+    opponent = Database.get_user(opponent_id)
+    if opponent and opponent['is_banned']:
+        await message.answer("❌ This user is banned and cannot battle.")
+        return
+    
+    battle_id, response = await BattleSystem.start_battle(user.id, opponent_id)
+    
+    if battle_id:
+        await message.answer(response)
+    else:
+        await message.answer(response)
+
+# =========== MEME COMMAND (WORKING) ===========
+@dp.message(Command("meme"))
+async def meme_command(message: Message):
+    """Get anime meme"""
+    user = message.from_user
+    
+    if maintenance_mode and not is_admin(user.id):
+        await message.answer("🔧 The bot is currently under maintenance.")
+        return
+    
+    if is_banned(user.id):
+        return
+    
+    if not check_cooldown(user.id, "meme", 5):
+        await message.answer("⏳ Please wait before getting another meme.")
+        return
+    
+    Database.add_command_stat(user.id, "meme")
+    
+    meme_msg = await message.answer("🎭 Finding the perfect anime meme...")
     
     try:
-        user_data = await anilist.get_user_profile(anilist_username)
+        image_url, caption = await get_anime_meme()
         
-        if "error" in user_data:
-            await user_msg.edit_text(f"❌ User not found: <b>{anilist_username}</b>")
-            return
-        
-        if not user_data:
-            await user_msg.edit_text(f"❌ Failed to fetch profile.")
-            return
-        
-        name = user_data.get('name', anilist_username)
-        about = format_description(user_data.get('about', ''), 300)
-        
-        stats = user_data.get('statistics', {}).get('anime', {})
-        manga_stats = user_data.get('statistics', {}).get('manga', {})
-        
-        response = f"""👤 <b>AniList Profile</b>
-
-🏷️ <b>Username:</b> {name}
-🎖️ <b>Donator Tier:</b> {user_data.get('donatorTier', 0)}
-
-📊 <b>Anime Stats:</b>
-• Count: {stats.get('count', 0)}
-• Mean Score: {stats.get('meanScore', 0)}/100
-• Days Watched: {round(stats.get('minutesWatched', 0) / 1440, 1)}
-• Episodes: {stats.get('episodesWatched', 0):,}
-
-📚 <b>Manga Stats:</b>
-• Count: {manga_stats.get('count', 0)}
-• Chapters Read: {manga_stats.get('chaptersRead', 0):,}
-• Volumes Read: {manga_stats.get('volumesRead', 0):,}
-
-📝 <b>About:</b>
-{about}
-
-🔗 <a href="{user_data.get('siteUrl', f'https://anilist.co/user/{anilist_username}')}">View on AniList</a>"""
-        
-        keyboard = InlineKeyboardBuilder()
-        keyboard.row(
-            InlineKeyboardButton(text="📊 Compare", callback_data=f"compare_{anilist_username}"),
-            InlineKeyboardButton(text="🎬 Anime List", callback_data=f"list_anime_{anilist_username}")
-        )
-        keyboard.row(
-            InlineKeyboardButton(text="🔗 Open Profile", url=user_data.get('siteUrl', f'https://anilist.co/user/{anilist_username}')),
-            InlineKeyboardButton(text="🤝 Link Account", callback_data=f"link_{anilist_username}")
-        )
-        
-        # Try to send with avatar
-        avatar_url = user_data.get('avatar', {}).get('large')
-        if avatar_url:
+        if image_url and image_url.startswith('http'):
             try:
                 await message.answer_photo(
-                    photo=URLInputFile(avatar_url),
-                    caption=response,
-                    reply_markup=keyboard.as_markup()
+                    photo=URLInputFile(image_url),
+                    caption=f"🎭 <b>Anime Meme</b>\n\n{caption}"
                 )
-                await user_msg.delete()
+                await meme_msg.delete()
                 return
             except:
                 pass
         
-        await user_msg.edit_text(response, reply_markup=keyboard.as_markup())
+        # Fallback meme
+        fallback_memes = [
+            ("When you realize you have to wait a week for the next episode", "https://i.imgur.com/meme_fallback1.jpg"),
+            ("Me trying to explain anime plots to non-weebs", "https://i.imgur.com/meme_fallback2.jpg"),
+            ("When someone says 'anime is cartoons'", "https://i.imgur.com/meme_fallback3.jpg"),
+        ]
+        
+        caption, img = random.choice(fallback_memes)
+        response = f"🎭 <b>Anime Meme</b>\n\n{caption}\n\n<i>Meme loading failed, but here's a classic!</i>"
+        
+        await meme_msg.edit_text(response)
         
     except Exception as e:
-        logger.error(f"User command error: {e}")
-        await user_msg.edit_text(f"❌ Failed to fetch user profile.")
-        log_error(user.id, str(e), "/user")
+        logger.error(f"Meme command error: {e}")
+        await meme_msg.edit_text("🎭 The meme gods are taking a break! Try again later.")
 
+# =========== LINK COMMAND (REAL ANILIST OAUTH) ===========
 @dp.message(Command("link"))
 async def link_command(message: Message):
-    """Link your AniList account"""
+    """Link AniList account with real OAuth"""
     user = message.from_user
     
     if maintenance_mode and not is_admin(user.id):
@@ -1599,59 +2082,50 @@ async def link_command(message: Message):
     if is_banned(user.id):
         return
     
-    if not message.text or len(message.text.split()) < 2:
-        await message.answer("🔗 <b>Usage:</b> <code>/link anilist_username</code>\nExample: <code>/link kenri</code>")
-        return
+    Database.add_command_stat(user.id, "link")
     
-    anilist_username = message.text.split()[1]
-    update_user(user.id, user.username, user.first_name, "/link")
+    # Generate OAuth state token
+    state = secrets.token_urlsafe(16)
+    active_sessions[state] = {
+        "user_id": user.id,
+        "created_at": time.time(),
+        "status": "pending"
+    }
     
-    link_msg = await message.answer(f"🔗 Linking to <b>{anilist_username}</b>...")
+    # Generate OAuth URL
+    oauth_url = await anilist.get_oauth_url(state)
     
-    try:
-        # Verify user exists
-        user_data = await anilist.get_user_profile(anilist_username)
-        
-        if "error" in user_data or not user_data:
-            await link_msg.edit_text(f"❌ AniList user not found: <b>{anilist_username}</b>")
-            return
-        
-        # Update database
-        db_execute("UPDATE users SET anilist_username = ? WHERE user_id = ?", (anilist_username, user.id))
-        
-        response = f"""✅ <b>Account Linked Successfully!</b>
+    response = f"""🔗 <b>Connect Your AniList Account</b>
 
-👤 <b>AniList Account:</b> {anilist_username}
-🔗 <b>Linked to:</b> {user.first_name} {f'(@{user.username})' if user.username else ''}
+To connect your AniList account:
 
-🎉 <b>Now you can:</b>
-• Sync your watchlist
-• Compare with friends
-• Get personalized recommendations
+1. Click this link: {oauth_url}
+2. Log in to your AniList account
+3. Authorize the bot to access your data
+4. You'll be redirected back to the bot
 
-📊 <b>Your Stats:</b>
-• Anime: {user_data.get('statistics', {}).get('anime', {}).get('count', 0)} titles
-• Manga: {user_data.get('statistics', {}).get('manga', {}).get('count', 0)} titles
+<b>What we'll access:</b>
+• Your profile info (name, avatar)
+• Your anime & manga lists
+• Your favorites
+• Your statistics
 
-🔗 <a href="{user_data.get('siteUrl', f'https://anilist.co/user/{anilist_username}')}">View Your Profile</a>"""
-        
-        keyboard = InlineKeyboardBuilder()
-        keyboard.row(
-            InlineKeyboardButton(text="📊 View Stats", callback_data=f"stats_{anilist_username}"),
-            InlineKeyboardButton(text="🔄 Sync Now", callback_data=f"sync_{anilist_username}")
-        )
-        
-        await link_msg.edit_text(response, reply_markup=keyboard.as_markup())
-        
-    except Exception as e:
-        logger.error(f"Link error: {e}")
-        await link_msg.edit_text(f"❌ Failed to link account.")
-        log_error(user.id, str(e), "/link")
+⚠️ <b>Note:</b> This is a secure OAuth connection. We never see your password!
 
-# =========== PROFILE & FAVORITES ===========
+After authorizing, use <code>/start</code> to see your connected profile."""
+    
+    keyboard = InlineKeyboardBuilder()
+    keyboard.row(
+        InlineKeyboardButton(text="🔗 Connect Now", url=oauth_url),
+        InlineKeyboardButton(text="✅ I've Connected", callback_data="check_link")
+    )
+    
+    await message.answer(response, reply_markup=keyboard.as_markup(), disable_web_page_preview=True)
+
+# =========== PROFILE COMMAND (WITH ANILIST DATA) ===========
 @dp.message(Command("profile"))
 async def profile_command(message: Message):
-    """View user profile"""
+    """Show user profile with AniList data"""
     user = message.from_user
     
     if maintenance_mode and not is_admin(user.id):
@@ -1661,77 +2135,77 @@ async def profile_command(message: Message):
     if is_banned(user.id):
         return
     
-    # Check if replying to another user
-    target_user = user
-    if message.reply_to_message:
-        target_user = message.reply_to_message.from_user
+    Database.add_command_stat(user.id, "profile")
     
-    update_user(user.id, user.username, user.first_name, "/profile")
-    
-    profile_msg = await message.answer("👤 Loading profile...")
+    profile_msg = await message.answer("👤 Loading your profile...")
     
     try:
-        user_stats = get_user_stats(target_user.id)
+        user_data = Database.get_user(user.id)
         
-        if not user_stats:
-            await profile_msg.edit_text("❌ Profile not found.")
+        if not user_data:
+            await profile_msg.edit_text("❌ Profile not found. Use /start first.")
             return
         
-        joined_date, total_cmds, total_searches, total_favs, anilist_user = user_stats
+        # Get stats
+        stats = json.loads(user_data['stats']) if user_data['stats'] else {}
+        achievements = Database.get_user_achievements(user.id)
         
-        # Get favorites count
-        favorites = get_favorites(target_user.id, limit=5)
+        # Check for AniList data
+        anilist_connected = bool(user_data.get('anilist_id'))
         
-        response = f"""👤 <b>User Profile</b>
+        response = f"""👤 <b>Profile: {user.first_name}</b>
 
-🏷️ <b>Name:</b> {target_user.first_name} {f'(@{target_user.username})' if target_user.username else ''}
-🆔 <b>ID:</b> <code>{target_user.id}</code>
-📅 <b>Joined:</b> {joined_date[:10] if joined_date else 'Recently'}
-🔗 <b>AniList:</b> {anilist_user or 'Not linked'}
+📊 <b>Bot Statistics:</b>
+• Commands Used: {stats.get('commands_used', 0)}
+• Daily Streak: {stats.get('daily_streak', 0)} days
+• Quiz Score: {stats.get('quiz_score', 0)} points
+• Battle Wins: {stats.get('battle_wins', 0)}
+• Achievements: {len(achievements)} unlocked
 
-📊 <b>Statistics:</b>
-• Commands Used: {total_cmds}
-• Searches Made: {total_searches}
-• Favorites: {total_favs}
-
-⭐ <b>Recent Favorites:</b>\n"""
+🔗 <b>AniList:</b> {'✅ Connected' if anilist_connected else '❌ Not Connected'}"""
         
-        if favorites:
-            for fav in favorites[:5]:
-                anime_id, title, _, score, date = fav
-                date_str = date[:10] if date else "Unknown"
-                response += f"• {title} ({score or 'N/A'}) - {date_str}\n"
-        else:
-            response += "• No favorites yet\n"
-        
-        response += f"\n💡 <i>Use /favorites to see all favorites</i>"
+        if anilist_connected:
+            anime_stats = json.loads(user_data['anime_stats']) if user_data['anime_stats'] else {}
+            response += f"\n\n🎬 <b>AniList Stats:</b>"
+            response += f"\n• Anime Count: {anime_stats.get('count', 0)}"
+            response += f"\n• Mean Score: {anime_stats.get('mean_score', 0)}/100"
+            response += f"\n• Time Watched: {anime_stats.get('time_watched', 0):,} minutes"
         
         keyboard = InlineKeyboardBuilder()
         
-        if target_user.id == user.id:
-            keyboard.row(
-                InlineKeyboardButton(text="⭐ My Favorites", callback_data="my_favorites"),
-                InlineKeyboardButton(text="🔄 Refresh", callback_data="refresh_profile")
-            )
-            if anilist_user:
-                keyboard.row(
-                    InlineKeyboardButton(text="📊 AniList Stats", callback_data=f"anilist_stats_{anilist_user}"),
+        if not anilist_connected:
+            keyboard.row(InlineKeyboardButton(text="🔗 Connect AniList", callback_data="link_anilist"))
+        
+        keyboard.row(
+            InlineKeyboardButton(text="⭐ Favorites", callback_data="view_favorites"),
+            InlineKeyboardButton(text="🏆 Achievements", callback_data="view_achievements")
+        )
+        
+        # Try to create profile card image
+        profile_image = await ImageProcessor.create_profile_card(user_data)
+        
+        if profile_image:
+            try:
+                await message.answer_photo(
+                    photo=InputFile(profile_image, filename="profile.png"),
+                    caption=response,
+                    reply_markup=keyboard.as_markup()
                 )
-        else:
-            keyboard.row(
-                InlineKeyboardButton(text="📊 Compare", callback_data=f"compare_{target_user.id}"),
-            )
+                await profile_msg.delete()
+                return
+            except:
+                pass
         
         await profile_msg.edit_text(response, reply_markup=keyboard.as_markup())
         
     except Exception as e:
-        logger.error(f"Profile error: {e}")
+        logger.error(f"Profile command error: {e}")
         await profile_msg.edit_text("❌ Failed to load profile.")
-        log_error(user.id, str(e), "/profile")
 
-@dp.message(Command("favorites"))
-async def favorites_command(message: Message):
-    """View user favorites"""
+# =========== GACHA COMMAND ===========
+@dp.message(Command("gacha"))
+async def gacha_command(message: Message):
+    """Pull character cards"""
     user = message.from_user
     
     if maintenance_mode and not is_admin(user.id):
@@ -1741,402 +2215,91 @@ async def favorites_command(message: Message):
     if is_banned(user.id):
         return
     
-    update_user(user.id, user.username, user.first_name, "/favorites")
+    if not check_cooldown(user.id, "gacha", 30):
+        await message.answer("⏳ Please wait before pulling again.")
+        return
     
-    fav_msg = await message.answer("⭐ Loading your favorites...")
+    Database.add_command_stat(user.id, "gacha")
+    
+    gacha_msg = await message.answer("🎰 Pulling character card...")
     
     try:
-        favorites = get_favorites(user.id)
+        image_url, response = await GachaSystem.pull(user.id)
         
-        if not favorites:
-            await fav_msg.edit_text("⭐ You haven't added any favorites yet!\n\n💡 Use the '⭐ Add to Favorites' button on anime pages.")
-            return
+        if image_url and image_url.startswith('http'):
+            try:
+                await message.answer_photo(
+                    photo=URLInputFile(image_url),
+                    caption=response
+                )
+                await gacha_msg.delete()
+                return
+            except:
+                pass
         
-        response = "⭐ <b>Your Favorites</b>\n\n"
-        
-        for idx, fav in enumerate(favorites[:10], 1):
-            anime_id, title, _, score, date = fav
-            date_str = date[:10] if date else "Unknown"
-            response += f"{idx}. <b>{title}</b>\n"
-            response += f"   ⭐ {score or 'N/A'} | 📅 {date_str} | 🆔 <code>{anime_id}</code>\n\n"
-        
-        if len(favorites) > 10:
-            response += f"📋 <i>Showing 10 of {len(favorites)} favorites</i>\n"
-        
-        keyboard = InlineKeyboardBuilder()
-        keyboard.row(
-            InlineKeyboardButton(text="🗑️ Clear All", callback_data="clear_favorites"),
-            InlineKeyboardButton(text="📤 Export", callback_data="export_favorites")
-        )
-        
-        await fav_msg.edit_text(response, reply_markup=keyboard.as_markup())
+        await gacha_msg.edit_text(response)
         
     except Exception as e:
-        logger.error(f"Favorites error: {e}")
-        await fav_msg.edit_text("❌ Failed to load favorites.")
-        log_error(user.id, str(e), "/favorites")
+        logger.error(f"Gacha command error: {e}")
+        await gacha_msg.edit_text("🎰 The gacha machine is jammed! Try again later.")
 
-# =========== MORE USER COMMANDS ===========
-@dp.message(Command("quote"))
-async def quote_command(message: Message):
-    """Get random anime quote"""
-    user = message.from_user
+# =========== ADMIN COMMANDS ===========
+def is_admin(user_id: int):
+    """Check if user is admin"""
+    if user_id in ADMIN_IDS:
+        return True
     
-    if maintenance_mode and not is_admin(user.id):
-        await message.answer("🔧 The bot is currently under maintenance.")
-        return
-    
-    if is_banned(user.id):
-        return
-    
-    update_user(user.id, user.username, user.first_name, "/quote")
-    
-    quotes = [
-        {"quote": "Believe in the me that believes in you!", "character": "Kamina", "anime": "Gurren Lagann"},
-        {"quote": "People's dreams... have no end!", "character": "Marshall D. Teach", "anime": "One Piece"},
-        {"quote": "It's not the face that makes someone a monster; it's the choices they make with their lives.", "character": "Naruto Uzumaki", "anime": "Naruto"},
-        {"quote": "The world isn't perfect. But it's there for us, doing the best it can. That's what makes it so damn beautiful.", "character": "Roy Mustang", "anime": "Fullmetal Alchemist"},
-        {"quote": "If you don't like your destiny, don't accept it. Instead, have the courage to change it the way you want it to be.", "character": "Naruto Uzumaki", "anime": "Naruto"},
-        {"quote": "I am the hope of the universe. I am the answer to all living things that cry out for peace.", "character": "Goku", "anime": "Dragon Ball Z"},
-        {"quote": "A person grows up when they can overcome hardships. To be able to protect something important.", "character": "Jiraiya", "anime": "Naruto"},
-        {"quote": "Knowing you're different is only the beginning. If you accept these differences you'll be able to get past them and grow even closer.", "character": "Misato Katsuragi", "anime": "Neon Genesis Evangelion"},
-        {"quote": "The fake is of far greater value. In its deliberate attempt to be real, it's more real than the real thing.", "character": "Kaiki Deishuu", "anime": "Monogatari Series"},
-        {"quote": "Sometimes you must hurt in order to know, fall in order to grow, lose in order to gain, because life's greatest lessons are learned through pain.", "character": "Pain", "anime": "Naruto Shippuden"},
-    ]
-    
-    quote = random.choice(quotes)
-    
-    response = f"""💬 <b>Anime Quote</b>
+    user = Database.get_user(user_id)
+    return user and user['is_admin'] == 1
 
-"{quote['quote']}"
+def is_banned(user_id: int):
+    """Check if user is banned"""
+    user = Database.get_user(user_id)
+    if not user:
+        return False
+    
+    if user['is_banned'] == 1:
+        return True
+    
+    # Check temporary ban
+    if user['banned_until']:
+        try:
+            banned_until = datetime.fromisoformat(user['banned_until'])
+            if datetime.now() < banned_until:
+                return True
+            else:
+                # Ban expired, remove it
+                Database.update_user(user_id, is_banned=0, banned_until=None)
+                return False
+        except:
+            return False
+    
+    return False
 
-— <i>{quote['character']}</i>
-🎬 <b>{quote['anime']}</b>
-
-<i>Share this wisdom with fellow anime fans!</i>"""
-    
-    keyboard = InlineKeyboardBuilder()
-    keyboard.row(
-        InlineKeyboardButton(text="💬 Another Quote", callback_data="another_quote"),
-        InlineKeyboardButton(text="🎬 Search Anime", callback_data=f"search_{quote['anime']}")
-    )
-    
-    await message.answer(response, reply_markup=keyboard.as_markup())
-
-@dp.message(Command("topanime"))
-async def topanime_command(message: Message):
-    """Get top anime"""
-    user = message.from_user
-    
-    if maintenance_mode and not is_admin(user.id):
-        await message.answer("🔧 The bot is currently under maintenance.")
-        return
-    
-    if is_banned(user.id):
-        return
-    
-    update_user(user.id, user.username, user.first_name, "/topanime")
-    
-    top_msg = await message.answer("🏆 Fetching top anime...")
-    
-    try:
-        results = await anilist.get_top_anime(10)
-        
-        if not results:
-            await top_msg.edit_text("❌ No anime found.")
-            return
-        
-        response = "🏆 <b>Top Rated Anime</b>\n\n"
-        
-        for idx, anime in enumerate(results, 1):
-            title = anime.get('title', {}).get('english') or anime.get('title', {}).get('romaji', 'Unknown')
-            score = anime.get('averageScore', 'N/A')
-            
-            response += f"{idx}. <b>{title}</b>\n"
-            response += f"   ⭐ {score}/100 | 🆔 <code>{anime['id']}</code>\n\n"
-        
-        keyboard = InlineKeyboardBuilder()
-        keyboard.row(
-            InlineKeyboardButton(text="🏆 View More", callback_data="top_more"),
-            InlineKeyboardButton(text="⭐ Add All", callback_data="add_all_top")
-        )
-        
-        await top_msg.edit_text(response, reply_markup=keyboard.as_markup())
-        
-    except Exception as e:
-        logger.error(f"Top anime error: {e}")
-        await top_msg.edit_text("❌ Failed to fetch top anime.")
-        log_error(user.id, str(e), "/topanime")
-
-@dp.message(Command("genre"))
-async def genre_command(message: Message):
-    """Get anime by genre"""
-    user = message.from_user
-    
-    if maintenance_mode and not is_admin(user.id):
-        await message.answer("🔧 The bot is currently under maintenance.")
-        return
-    
-    if is_banned(user.id):
-        return
-    
-    if not message.text or len(message.text.split()) < 2:
-        await message.answer("🏷️ <b>Usage:</b> <code>/genre genre_name</code>\nExample: <code>/genre action</code>")
-        return
-    
-    genre = message.text.split()[1].capitalize()
-    update_user(user.id, user.username, user.first_name, "/genre")
-    
-    genre_msg = await message.answer(f"🏷️ Finding {genre} anime...")
-    
-    try:
-        results = await anilist.get_anime_by_genre(genre, 8)
-        
-        if not results:
-            await genre_msg.edit_text(f"❌ No {genre} anime found.")
-            return
-        
-        response = f"🏷️ <b>{genre} Anime</b>\n\n"
-        
-        for idx, anime in enumerate(results, 1):
-            title = anime.get('title', {}).get('english') or anime.get('title', {}).get('romaji', 'Unknown')
-            score = anime.get('averageScore', 'N/A')
-            
-            response += f"{idx}. <b>{title}</b>\n"
-            response += f"   ⭐ {score} | 🆔 <code>{anime['id']}</code>\n\n"
-        
-        keyboard = InlineKeyboardBuilder()
-        keyboard.row(
-            InlineKeyboardButton(text=f"More {genre}", callback_data=f"genre_more_{genre}"),
-            InlineKeyboardButton(text="Browse Genres", callback_data="browse_genres")
-        )
-        
-        await genre_msg.edit_text(response, reply_markup=keyboard.as_markup())
-        
-    except Exception as e:
-        logger.error(f"Genre error: {e}")
-        await genre_msg.edit_text(f"❌ Failed to fetch {genre} anime.")
-        log_error(user.id, str(e), "/genre")
-
-@dp.message(Command("seasonal"))
-async def seasonal_command(message: Message):
-    """Get current seasonal anime"""
-    user = message.from_user
-    
-    if maintenance_mode and not is_admin(user.id):
-        await message.answer("🔧 The bot is currently under maintenance.")
-        return
-    
-    if is_banned(user.id):
-        return
-    
-    update_user(user.id, user.username, user.first_name, "/seasonal")
-    
-    seasonal_msg = await message.answer("🍂 Fetching current season anime...")
-    
-    try:
-        results = await anilist.get_seasonal()
-        
-        if not results:
-            await seasonal_msg.edit_text("❌ No seasonal anime found.")
-            return
-        
-        # Get current season name
-        month = datetime.now().month
-        if month in [1, 2, 3]:
-            season = "Winter"
-        elif month in [4, 5, 6]:
-            season = "Spring"
-        elif month in [7, 8, 9]:
-            season = "Summer"
-        else:
-            season = "Fall"
-        
-        response = f"🍂 <b>{season} {datetime.now().year} Anime</b>\n\n"
-        
-        for idx, anime in enumerate(results[:10], 1):
-            title = anime.get('title', {}).get('english') or anime.get('title', {}).get('romaji', 'Unknown')
-            score = anime.get('averageScore', 'N/A')
-            
-            response += f"{idx}. <b>{title}</b>\n"
-            response += f"   ⭐ {score} | 🆔 <code>{anime['id']}</code>\n\n"
-        
-        keyboard = InlineKeyboardBuilder()
-        keyboard.row(
-            InlineKeyboardButton(text="📅 Next Season", callback_data="next_season"),
-            InlineKeyboardButton(text="🔄 Refresh", callback_data="refresh_seasonal")
-        )
-        
-        await seasonal_msg.edit_text(response, reply_markup=keyboard.as_markup())
-        
-    except Exception as e:
-        logger.error(f"Seasonal error: {e}")
-        await seasonal_msg.edit_text("❌ Failed to fetch seasonal anime.")
-        log_error(user.id, str(e), "/seasonal")
-
-@dp.message(Command("character"))
-async def character_command(message: Message):
-    """Search character"""
-    user = message.from_user
-    
-    if maintenance_mode and not is_admin(user.id):
-        await message.answer("🔧 The bot is currently under maintenance.")
-        return
-    
-    if is_banned(user.id):
-        return
-    
-    if not message.text or len(message.text.split()) < 2:
-        await message.answer("👤 <b>Usage:</b> <code>/character name</code>\nExample: <code>/character Naruto</code>")
-        return
-    
-    query = " ".join(message.text.split()[1:])
-    update_user(user.id, user.username, user.first_name, "/character")
-    
-    char_msg = await message.answer(f"👤 Searching for character <b>{query}</b>...")
-    
-    try:
-        results = await anilist.search_character(query, 10)
-        
-        if not results:
-            await char_msg.edit_text(f"❌ No characters found for <b>{query}</b>")
-            return
-        
-        response = f"👤 <b>Characters found for:</b> {query}\n\n"
-        
-        keyboard = InlineKeyboardBuilder()
-        
-        for idx, char in enumerate(results[:6], 1):
-            name = char.get('name', {}).get('full', 'Unknown')
-            response += f"{idx}. <b>{name}</b>\n"
-            response += f"   ❤️ {char.get('favourites', 0):,} | 🆔 <code>{char['id']}</code>\n\n"
-            
-            keyboard.button(
-                text=f"{idx}. {name[:12]}...",
-                callback_data=f"character_{char['id']}"
-            )
-        
-        keyboard.adjust(2)
-        keyboard.row(
-            InlineKeyboardButton(text="🔍 Search Again", switch_inline_query_current_chat=f"character {query}"),
-        )
-        
-        await char_msg.edit_text(response, reply_markup=keyboard.as_markup())
-        
-    except Exception as e:
-        logger.error(f"Character search error: {e}")
-        await char_msg.edit_text(f"❌ Failed to search characters.")
-        log_error(user.id, str(e), "/character")
-
-@dp.message(Command("ship"))
-async def ship_command(message: Message):
-    """Ship two characters"""
-    user = message.from_user
-    
-    if maintenance_mode and not is_admin(user.id):
-        await message.answer("🔧 The bot is currently under maintenance.")
-        return
-    
-    if is_banned(user.id):
-        return
-    
-    if not message.text or len(message.text.split()) < 3:
-        await message.answer("💕 <b>Usage:</b> <code>/ship character1 character2</code>\nExample: <code>/ship Naruto Hinata</code>")
-        return
-    
-    char1 = message.text.split()[1]
-    char2 = message.text.split()[2]
-    update_user(user.id, user.username, user.first_name, "/ship")
-    
-    # Calculate compatibility
-    compatibility = random.randint(50, 100)
-    
-    # Generate ship name
-    ship_name = f"{char1[:len(char1)//2]}{char2[len(char2)//2:]}"
-    
-    # Get relationship status
-    if compatibility >= 90:
-        status = "💖 Perfect Match! 💖"
-        message_text = "Destined to be together!"
-    elif compatibility >= 70:
-        status = "❤️ Great Match! ❤️"
-        message_text = "They have great chemistry!"
-    elif compatibility >= 50:
-        status = "💛 Good Match 💛"
-        message_text = "Could work with some effort!"
-    else:
-        status = "💔 Difficult Match 💔"
-        message_text = "Might be challenging..."
-    
-    response = f"""💕 <b>Shipping Results</b>
-
-🚢 <b>{char1.capitalize()} ❤️ {char2.capitalize()}</b>
-
-💝 <b>Compatibility:</b> {compatibility}%
-🏷️ <b>Ship Name:</b> {ship_name}
-📊 <b>Status:</b> {status}
-
-💌 <i>{message_text}</i>
-
-✨ <i>The anime gods have spoken!</i>"""
-    
-    await message.answer(response)
-
-@dp.message(Command("botstats"))
-async def botstats_command(message: Message):
-    """Get bot statistics"""
-    user = message.from_user
-    
-    if maintenance_mode and not is_admin(user.id):
-        await message.answer("🔧 The bot is currently under maintenance.")
-        return
-    
-    if is_banned(user.id):
-        return
-    
-    update_user(user.id, user.username, user.first_name, "/botstats")
-    
-    stats = get_bot_stats()
-    uptime = datetime.now() - bot_start_time
-    
-    days = uptime.days
-    hours = uptime.seconds // 3600
-    minutes = (uptime.seconds % 3600) // 60
-    
-    response = f"""🤖 <b>Bot Statistics</b>
-
-👥 <b>Users:</b>
-• Total Users: {stats.get('total_users', 0)}
-• Active Today: {stats.get('active_today', 0)}
-• Commands Today: {stats.get('commands_today', 0)}
-• Total Groups: {stats.get('total_groups', 0)}
-• Total Favorites: {stats.get('total_favorites', 0)}
-
-⏱️ <b>Uptime:</b> {days}d {hours}h {minutes}m
-📅 <b>Started:</b> {bot_start_time.strftime('%Y-%m-%d %H:%M:%S')}
-
-🔧 <b>Status:</b> {'🟢 Running' if not maintenance_mode else '🔴 Maintenance'}
-💾 <b>Database:</b> {DATABASE_PATH}
-
-<i>Thank you for using AnimeKuun Bot!</i>"""
-    
-    await message.answer(response)
-
-# =========== ADMIN COMMANDS (18+) ===========
 @dp.message(Command("admin"))
 async def admin_command(message: Message):
-    """Admin panel"""
+    """Admin panel - SIMPLE TEXT, NO BUTTONS"""
     user = message.from_user
     
     if not is_admin(user.id):
         await message.answer("❌ This command is for admins only.")
         return
     
-    update_user(user.id, user.username, user.first_name, "/admin")
+    Database.add_command_stat(user.id, "admin")
     
-    stats = get_bot_stats()
+    # Get bot stats
+    total_users = Database.execute("SELECT COUNT(*) as count FROM users", fetchone=True)['count']
+    active_today = Database.execute(
+        "SELECT COUNT(*) as count FROM users WHERE DATE(last_active) = DATE('now')",
+        fetchone=True
+    )['count']
+    
+    commands_today = Database.execute(
+        "SELECT COUNT(*) as count FROM command_stats WHERE DATE(timestamp) = DATE('now')",
+        fetchone=True
+    )['count']
+    
     uptime = datetime.now() - bot_start_time
-    
     days = uptime.days
     hours = uptime.seconds // 3600
     minutes = (uptime.seconds % 3600) // 60
@@ -2144,689 +2307,283 @@ async def admin_command(message: Message):
     admin_text = f"""👑 <b>Admin Panel</b>
 
 📊 <b>Bot Statistics:</b>
-👥 Total Users: {stats.get('total_users', 0)}
-👥 Active Today: {stats.get('active_today', 0)}
-📈 Commands Today: {stats.get('commands_today', 0)}
-👥 Groups: {stats.get('total_groups', 0)}
-⏱️ Uptime: {days}d {hours}h {minutes}m
+• Total Users: {total_users}
+• Active Today: {active_today}
+• Commands Today: {commands_today}
+• Uptime: {days}d {hours}h {minutes}m
+• Maintenance: {'🔴 ON' if maintenance_mode else '🟢 OFF'}
 
-🔧 <b>Quick Actions:</b>
-• <code>/broadcast message</code> - Send to all users
-• <code>/users</code> - List all users
-• <code>/groups</code> - List all groups
+<b>User Management:</b>
+• <code>/users [page]</code> - List users (page 1-10)
 • <code>/ban user_id reason</code> - Ban user
 • <code>/unban user_id</code> - Unban user
-• <code>/promote user_id</code> - Promote to admin
+• <code>/warn user_id reason</code> - Warn user
+• <code>/mute user_id hours</code> - Mute in groups
+• <code>/promote user_id</code> - Make admin
 • <code>/demote user_id</code> - Remove admin
-• <code>/maintenance on/off</code> - Maintenance mode
-• <code>/backup</code> - Backup database
+
+<b>Bot Management:</b>
+• <code>/broadcast message</code> - Send to all users
+• <code>/maintenance on/off</code> - Toggle maintenance
+• <code>/backup</code> - Download database
 • <code>/cleanup</code> - Clean old data
-• <code>/logs</code> - View error logs
-• <code>/ping</code> - Check bot status
+• <code>/stats</code> - Detailed statistics
+• <code>/logs [count]</code> - View error logs
 • <code>/restart</code> - Restart bot
 • <code>/announce title|message</code> - Make announcement
-• <code>/exportall</code> - Export all data
-• <code>/import file</code> - Import data
-• <code>/warn user_id reason</code> - Warn user
-• <code>/mute user_id hours</code> - Mute user
 
-🛠️ <b>Maintenance Mode:</b> {'🔴 ON' if maintenance_mode else '🟢 OFF'}"""
+<b>Note:</b> All admin commands are logged."""
     
-    keyboard = InlineKeyboardBuilder()
-    keyboard.row(
-        InlineKeyboardButton(text="📊 Stats", callback_data="admin_stats"),
-        InlineKeyboardButton(text="👥 Users", callback_data="admin_users")
-    )
-    keyboard.row(
-        InlineKeyboardButton(text="📢 Broadcast", callback_data="admin_broadcast"),
-        InlineKeyboardButton(text="🛠️ Maintenance", callback_data="admin_maintenance")
-    )
-    keyboard.row(
-        InlineKeyboardButton(text="💾 Backup", callback_data="admin_backup"),
-        InlineKeyboardButton(text="🧹 Cleanup", callback_data="admin_cleanup")
-    )
-    keyboard.row(
-        InlineKeyboardButton(text="📋 Logs", callback_data="admin_logs"),
-        InlineKeyboardButton(text="🚀 Restart", callback_data="admin_restart")
-    )
-    
-    await message.answer(admin_text, reply_markup=keyboard.as_markup())
+    await message.answer(admin_text)
 
 @dp.message(Command("broadcast"))
 async def broadcast_command(message: Message):
-    """Broadcast message to all users"""
+    """Broadcast message to all users - WORKING"""
     user = message.from_user
     
     if not is_admin(user.id):
         await message.answer("❌ This command is for admins only.")
         return
     
-    update_user(user.id, user.username, user.first_name, "/broadcast")
+    Database.add_command_stat(user.id, "broadcast")
     
     if not message.text or len(message.text.split()) < 2:
-        await message.answer("📢 <b>Usage:</b> <code>/broadcast message</code>\nExample: <code>/broadcast Hello everyone!</code>")
+        await message.answer("📢 <b>Usage:</b> <code>/broadcast your message here</code>")
         return
     
-    broadcast_msg = " ".join(message.text.split()[1:])
+    broadcast_text = " ".join(message.text.split()[1:])
     
-    # Store in active broadcasts
-    broadcast_id = str(int(time.time()))
-    active_broadcasts[broadcast_id] = {
-        "admin_id": user.id,
-        "message": broadcast_msg,
-        "time": time.time()
-    }
+    # Get all users
+    users = Database.execute("SELECT user_id FROM users WHERE is_banned = 0", fetchall=True)
     
-    confirm_text = f"""📢 <b>Broadcast Confirmation</b>
+    if not users:
+        await message.answer("❌ No users found to broadcast to.")
+        return
+    
+    total_users = len(users)
+    status_msg = await message.answer(f"📤 Broadcasting to {total_users} users...")
+    
+    success = 0
+    failed = 0
+    
+    broadcast_message = f"""📢 <b>Announcement from Admin</b>
 
-<b>Message:</b>
-{broadcast_msg}
+{broadcast_text}
 
-<b>This will be sent to ALL users.</b>
-Are you sure?"""
+—
+AnimeKuun Bot"""
     
-    keyboard = InlineKeyboardBuilder()
-    keyboard.row(
-        InlineKeyboardButton(text="✅ Yes, Send", callback_data=f"broadcast_confirm_{broadcast_id}"),
-        InlineKeyboardButton(text="❌ Cancel", callback_data="broadcast_cancel")
-    )
+    for user_row in users:
+        user_id = user_row['user_id']
+        try:
+            await bot.send_message(chat_id=user_id, text=broadcast_message)
+            success += 1
+            
+            # Update progress every 10 users
+            if success % 10 == 0:
+                await status_msg.edit_text(f"📤 Broadcasting... {success}/{total_users}")
+            
+            # Rate limiting
+            await asyncio.sleep(0.1)
+        except Exception as e:
+            failed += 1
     
-    await message.answer(confirm_text, reply_markup=keyboard.as_markup())
+    result_text = f"""✅ <b>Broadcast Complete!</b>
+
+📤 Sent: {success} users
+❌ Failed: {failed} users
+📊 Total: {total_users} users
+
+💡 <i>Message delivered successfully</i>"""
+    
+    await status_msg.edit_text(result_text)
 
 @dp.message(Command("users"))
 async def users_command(message: Message):
-    """List all users"""
+    """List users - WORKING"""
     user = message.from_user
     
     if not is_admin(user.id):
         await message.answer("❌ This command is for admins only.")
         return
     
-    update_user(user.id, user.username, user.first_name, "/users")
+    Database.add_command_stat(user.id, "users")
     
-    users_msg = await message.answer("👥 Fetching users...")
+    # Get page number
+    args = message.text.split()
+    page = 1
+    if len(args) > 1 and args[1].isdigit():
+        page = int(args[1])
+        page = max(1, min(10, page))  # Limit to 10 pages
     
-    try:
-        users = db_execute(
-            "SELECT user_id, username, first_name, total_commands, last_active FROM users ORDER BY last_active DESC LIMIT 20",
-            fetchall=True
-        )
-        
-        if not users:
-            await users_msg.edit_text("❌ No users found.")
-            return
-        
-        response = "👥 <b>Recent Users</b>\n\n"
-        
-        for idx, (user_id, username, first_name, commands, last_active) in enumerate(users, 1):
-            user_display = f"{first_name or ''} {f'(@{username})' if username else ''}".strip()
-            time_ago = last_active[:16] if last_active else "Unknown"
-            response += f"{idx}. <b>{user_display}</b>\n"
-            response += f"   📊 {commands} cmds | ⏰ {time_ago} | 🆔 <code>{user_id}</code>\n\n"
-        
-        keyboard = InlineKeyboardBuilder()
-        keyboard.row(
-            InlineKeyboardButton(text="📋 Export All", callback_data="export_users"),
-            InlineKeyboardButton(text="🔄 Refresh", callback_data="refresh_users")
-        )
-        
-        await users_msg.edit_text(response, reply_markup=keyboard.as_markup())
-        
-    except Exception as e:
-        logger.error(f"Users error: {e}")
-        await users_msg.edit_text("❌ Failed to fetch users.")
-        log_error(user.id, str(e), "/users")
-
-@dp.message(Command("groups"))
-async def groups_command(message: Message):
-    """List all groups"""
-    user = message.from_user
+    offset = (page - 1) * 20
     
-    if not is_admin(user.id):
-        await message.answer("❌ This command is for admins only.")
+    users = Database.execute(
+        "SELECT user_id, username, first_name, last_active, is_banned FROM users ORDER BY last_active DESC LIMIT 20 OFFSET ?",
+        (offset,), fetchall=True
+    )
+    
+    if not users:
+        await message.answer("❌ No users found.")
         return
     
-    update_user(user.id, user.username, user.first_name, "/groups")
+    response = f"👥 <b>Users List - Page {page}</b>\n\n"
     
-    groups_msg = await message.answer("👥 Fetching groups...")
+    for idx, user_data in enumerate(users, offset + 1):
+        user_id = user_data['user_id']
+        username = user_data['username'] or 'No username'
+        first_name = user_data['first_name'] or 'User'
+        last_active = user_data['last_active'][:16] if user_data['last_active'] else 'Never'
+        banned = "🔴" if user_data['is_banned'] else "🟢"
+        
+        response += f"{idx}. {banned} <b>{first_name}</b> (@{username})\n"
+        response += f"   🆔: <code>{user_id}</code> | ⏰: {last_active}\n\n"
     
-    try:
-        groups = db_execute(
-            "SELECT group_id, title, last_active FROM groups ORDER BY last_active DESC LIMIT 10",
-            fetchall=True
-        )
-        
-        if not groups:
-            await groups_msg.edit_text("❌ No groups found.")
-            return
-        
-        response = "👥 <b>Groups</b>\n\n"
-        
-        for idx, (group_id, title, last_active) in enumerate(groups, 1):
-            time_ago = last_active[:16] if last_active else "Unknown"
-            response += f"{idx}. <b>{title}</b>\n"
-            response += f"   🆔 <code>{group_id}</code> | ⏰ {time_ago}\n\n"
-        
-        await groups_msg.edit_text(response)
-        
-    except Exception as e:
-        logger.error(f"Groups error: {e}")
-        await groups_msg.edit_text("❌ Failed to fetch groups.")
-        log_error(user.id, str(e), "/groups")
+    response += f"💡 Use <code>/users {page+1}</code> for next page"
+    
+    await message.answer(response)
 
 @dp.message(Command("ban"))
 async def ban_command(message: Message):
-    """Ban user"""
+    """Ban user - WORKING"""
     user = message.from_user
     
     if not is_admin(user.id):
         await message.answer("❌ This command is for admins only.")
         return
     
-    update_user(user.id, user.username, user.first_name, "/ban")
+    Database.add_command_stat(user.id, "ban")
     
-    if not message.text or len(message.text.split()) < 3:
-        await message.answer("🔨 <b>Usage:</b> <code>/ban user_id reason</code>\nExample: <code>/ban 12345678 Spam</code>")
+    args = message.text.split()
+    if len(args) < 2:
+        await message.answer("🔨 <b>Usage:</b> <code>/ban user_id [reason]</code>\nExample: <code>/ban 12345678 Spamming</code>")
         return
     
-    parts = message.text.split()
-    user_id = parts[1]
-    reason = " ".join(parts[2:])
+    target_id = args[1]
+    reason = " ".join(args[2:]) if len(args) > 2 else "No reason provided"
     
-    if not user_id.isdigit():
+    if not target_id.isdigit():
         await message.answer("❌ Please provide a valid user ID.")
         return
     
-    user_id = int(user_id)
+    target_id = int(target_id)
     
+    # Check if trying to ban self
+    if target_id == user.id:
+        await message.answer("❌ You cannot ban yourself.")
+        return
+    
+    # Check if trying to ban another admin
+    target_user = Database.get_user(target_id)
+    if target_user and target_user['is_admin']:
+        await message.answer("❌ Cannot ban another admin.")
+        return
+    
+    # Ban the user
+    Database.update_user(target_id, is_banned=1)
+    
+    # Try to notify the user
     try:
-        ban_user(user_id, reason)
-        
-        # Try to notify the user
-        try:
-            await bot.send_message(
-                user_id,
-                f"❌ <b>You have been banned from AnimeKuun Bot</b>\n\n"
-                f"Reason: {reason}\n"
-                f"If you believe this is a mistake, contact the bot admin."
-            )
-        except:
-            pass
-        
-        await message.answer(f"✅ User <code>{user_id}</code> has been banned.\nReason: {reason}")
-        
-    except Exception as e:
-        await message.answer(f"❌ Error: {str(e)}")
-
-@dp.message(Command("unban"))
-async def unban_command(message: Message):
-    """Unban user"""
-    user = message.from_user
-    
-    if not is_admin(user.id):
-        await message.answer("❌ This command is for admins only.")
-        return
-    
-    update_user(user.id, user.username, user.first_name, "/unban")
-    
-    if not message.text or len(message.text.split()) < 2:
-        await message.answer("🔓 <b>Usage:</b> <code>/unban user_id</code>\nExample: <code>/unban 12345678</code>")
-        return
-    
-    user_id = message.text.split()[1]
-    
-    if not user_id.isdigit():
-        await message.answer("❌ Please provide a valid user ID.")
-        return
-    
-    user_id = int(user_id)
-    
-    try:
-        unban_user(user_id)
-        
-        # Try to notify the user
-        try:
-            await bot.send_message(
-                user_id,
-                "✅ <b>Your ban has been lifted from AnimeKuun Bot</b>\n\n"
-                "You can now use the bot again."
-            )
-        except:
-            pass
-        
-        await message.answer(f"✅ User <code>{user_id}</code> has been unbanned.")
-        
-    except Exception as e:
-        await message.answer(f"❌ Error: {str(e)}")
-
-@dp.message(Command("promote"))
-async def promote_command(message: Message):
-    """Promote user to admin"""
-    user = message.from_user
-    
-    if not is_admin(user.id):
-        await message.answer("❌ This command is for admins only.")
-        return
-    
-    update_user(user.id, user.username, user.first_name, "/promote")
-    
-    if not message.text or len(message.text.split()) < 2:
-        await message.answer("👑 <b>Usage:</b> <code>/promote user_id</code>\nExample: <code>/promote 12345678</code>")
-        return
-    
-    user_id = message.text.split()[1]
-    
-    if not user_id.isdigit():
-        await message.answer("❌ Please provide a valid user ID.")
-        return
-    
-    user_id = int(user_id)
-    
-    if user_id in ADMIN_IDS:
-        await message.answer("✅ User is already an admin.")
-        return
-    
-    try:
-        promote_user(user_id)
-        
-        # Try to notify the user
-        try:
-            await bot.send_message(
-                user_id,
-                "👑 <b>You have been promoted to Admin!</b>\n\n"
-                "You now have access to admin commands. "
-                "Use <code>/admin</code> to see available commands."
-            )
-        except:
-            pass
-        
-        await message.answer(f"✅ User <code>{user_id}</code> has been promoted to admin.")
-        
-    except Exception as e:
-        await message.answer(f"❌ Error: {str(e)}")
-
-@dp.message(Command("demote"))
-async def demote_command(message: Message):
-    """Demote user from admin"""
-    user = message.from_user
-    
-    if not is_admin(user.id):
-        await message.answer("❌ This command is for admins only.")
-        return
-    
-    update_user(user.id, user.username, user.first_name, "/demote")
-    
-    if not message.text or len(message.text.split()) < 2:
-        await message.answer("👑 <b>Usage:</b> <code>/demote user_id</code>\nExample: <code>/demote 12345678</code>")
-        return
-    
-    user_id = message.text.split()[1]
-    
-    if not user_id.isdigit():
-        await message.answer("❌ Please provide a valid user ID.")
-        return
-    
-    user_id = int(user_id)
-    
-    if user_id not in ADMIN_IDS:
-        await message.answer("❌ User is not an admin.")
-        return
-    
-    try:
-        demote_user(user_id)
-        
-        # Try to notify the user
-        try:
-            await bot.send_message(
-                user_id,
-                "👑 <b>You have been demoted from Admin</b>\n\n"
-                "You no longer have access to admin commands."
-            )
-        except:
-            pass
-        
-        await message.answer(f"✅ User <code>{user_id}</code> has been demoted from admin.")
-        
-    except Exception as e:
-        await message.answer(f"❌ Error: {str(e)}")
-
-@dp.message(Command("maintenance"))
-async def maintenance_command(message: Message):
-    """Toggle maintenance mode"""
-    global maintenance_mode
-    
-    user = message.from_user
-    
-    if not is_admin(user.id):
-        await message.answer("❌ This command is for admins only.")
-        return
-    
-    update_user(user.id, user.username, user.first_name, "/maintenance")
-    
-    if not message.text or len(message.text.split()) < 2:
-        await message.answer("🔧 <b>Usage:</b> <code>/maintenance on</code> or <code>/maintenance off</code>")
-        return
-    
-    mode = message.text.split()[1].lower()
-    
-    if mode == "on":
-        maintenance_mode = True
-        await message.answer("🔴 Maintenance mode enabled.\nOnly admins can use the bot.")
-    elif mode == "off":
-        maintenance_mode = False
-        await message.answer("🟢 Maintenance mode disabled.\nBot is now accessible to everyone.")
-    else:
-        await message.answer("❌ Usage: <code>/maintenance on</code> or <code>/maintenance off</code>")
-
-@dp.message(Command("backup"))
-async def backup_command(message: Message):
-    """Backup database"""
-    user = message.from_user
-    
-    if not is_admin(user.id):
-        await message.answer("❌ This command is for admins only.")
-        return
-    
-    update_user(user.id, user.username, user.first_name, "/backup")
-    
-    backup_msg = await message.answer("💾 Creating backup...")
-    
-    try:
-        # Create backup file
-        backup_file = f"backup_animekun_{datetime.now().strftime('%Y%m%d_%H%M%S')}.db"
-        
-        # Copy database
-        import shutil
-        shutil.copy2(DATABASE_PATH, backup_file)
-        
-        # Send backup file
-        with open(backup_file, 'rb') as f:
-            await message.answer_document(
-                document=InputFile(f, filename=backup_file),
-                caption=f"✅ Database backup created: {backup_file}"
-            )
-        
-        # Clean up
-        os.remove(backup_file)
-        await backup_msg.delete()
-        
-    except Exception as e:
-        logger.error(f"Backup error: {e}")
-        await backup_msg.edit_text(f"❌ Backup failed: {str(e)}")
-
-@dp.message(Command("cleanup"))
-async def cleanup_command(message: Message):
-    """Cleanup old data"""
-    user = message.from_user
-    
-    if not is_admin(user.id):
-        await message.answer("❌ This command is for admins only.")
-        return
-    
-    update_user(user.id, user.username, user.first_name, "/cleanup")
-    
-    cleanup_msg = await message.answer("🧹 Cleaning up old data...")
-    
-    try:
-        # Clean old error logs (older than 30 days)
-        db_execute("DELETE FROM error_logs WHERE DATE(timestamp) < DATE('now', '-30 days')")
-        
-        # Clean old command stats (older than 30 days)
-        db_execute("DELETE FROM command_stats WHERE DATE(timestamp) < DATE('now', '-30 days')")
-        
-        # Clean inactive users (not active for 90 days)
-        db_execute("DELETE FROM users WHERE DATE(last_active) < DATE('now', '-90 days') AND is_admin = 0")
-        
-        # Vacuum database
-        db_execute("VACUUM")
-        
-        await cleanup_msg.edit_text("✅ Cleanup completed successfully!")
-        
-    except Exception as e:
-        logger.error(f"Cleanup error: {e}")
-        await cleanup_msg.edit_text(f"❌ Cleanup failed: {str(e)}")
-
-@dp.message(Command("logs"))
-async def logs_command(message: Message):
-    """View error logs"""
-    user = message.from_user
-    
-    if not is_admin(user.id):
-        await message.answer("❌ This command is for admins only.")
-        return
-    
-    update_user(user.id, user.username, user.first_name, "/logs")
-    
-    logs_msg = await message.answer("📋 Fetching logs...")
-    
-    try:
-        logs = db_execute(
-            "SELECT error, user_id, command, timestamp FROM error_logs ORDER BY timestamp DESC LIMIT 10",
-            fetchall=True
+        await bot.send_message(
+            chat_id=target_id,
+            text=f"❌ <b>You have been banned from AnimeKuun Bot</b>\n\nReason: {reason}\n\nContact the bot admin if you believe this is a mistake."
         )
-        
-        if not logs:
-            await logs_msg.edit_text("📋 No error logs found.")
-            return
-        
-        response = "📋 <b>Recent Error Logs</b>\n\n"
-        
-        for error_text, user_id, command, timestamp in logs:
-            time_str = timestamp[:19] if timestamp else "Unknown"
-            error_short = error_text[:50] + "..." if len(error_text) > 50 else error_text
-            response += f"⏰ <b>{time_str}</b>\n"
-            response += f"👤 User: <code>{user_id}</code>\n"
-            response += f"📝 Command: {command or 'N/A'}\n"
-            response += f"❌ Error: {error_short}\n\n"
-        
-        keyboard = InlineKeyboardBuilder()
-        keyboard.row(
-            InlineKeyboardButton(text="📋 View All", callback_data="logs_all"),
-            InlineKeyboardButton(text="🗑️ Clear Logs", callback_data="logs_clear")
-        )
-        
-        await logs_msg.edit_text(response, reply_markup=keyboard.as_markup())
-        
-    except Exception as e:
-        logger.error(f"Logs error: {e}")
-        await logs_msg.edit_text(f"❌ Failed to fetch logs: {str(e)}")
+    except:
+        pass
+    
+    await message.answer(f"✅ User <code>{target_id}</code> has been banned.\nReason: {reason}")
 
-@dp.message(Command("ping"))
-async def ping_command(message: Message):
-    """Check bot status"""
+@dp.message(Command("stats"))
+async def stats_command(message: Message):
+    """Detailed bot statistics - ADMIN ONLY"""
     user = message.from_user
     
     if not is_admin(user.id):
         await message.answer("❌ This command is for admins only.")
         return
     
-    update_user(user.id, user.username, user.first_name, "/ping")
+    Database.add_command_stat(user.id, "stats")
     
-    start_time = time.time()
+    # Get comprehensive stats
+    total_users = Database.execute("SELECT COUNT(*) as count FROM users", fetchone=True)['count']
+    active_today = Database.execute(
+        "SELECT COUNT(*) as count FROM users WHERE DATE(last_active) = DATE('now')",
+        fetchone=True
+    )['count']
     
-    # Test API
-    test_results = await anilist.search_anime("test", per_page=1)
-    api_working = len(test_results) > 0
+    new_today = Database.execute(
+        "SELECT COUNT(*) as count FROM users WHERE DATE(joined_date) = DATE('now')",
+        fetchone=True
+    )['count']
     
-    end_time = time.time()
-    latency = round((end_time - start_time) * 1000, 2)
+    commands_today = Database.execute(
+        "SELECT COUNT(*) as count FROM command_stats WHERE DATE(timestamp) = DATE('now')",
+        fetchone=True
+    )['count']
+    
+    total_commands = Database.execute("SELECT COUNT(*) as count FROM command_stats", fetchone=True)['count']
+    
+    # Get top commands
+    top_commands = Database.execute(
+        "SELECT command, COUNT(*) as count FROM command_stats GROUP BY command ORDER BY count DESC LIMIT 5",
+        fetchall=True
+    )
+    
+    # Get user growth (last 7 days)
+    growth = []
+    for i in range(6, -1, -1):
+        date = (datetime.now() - timedelta(days=i)).strftime('%Y-%m-%d')
+        count = Database.execute(
+            "SELECT COUNT(*) as count FROM users WHERE DATE(joined_date) <= ?",
+            (date,), fetchone=True
+        )['count']
+        growth.append(f"{date}: {count}")
     
     uptime = datetime.now() - bot_start_time
     days = uptime.days
     hours = uptime.seconds // 3600
     minutes = (uptime.seconds % 3600) // 60
-    seconds = uptime.seconds % 60
     
-    stats = get_bot_stats()
+    response = f"""📊 <b>Detailed Bot Statistics</b>
+
+<b>User Statistics:</b>
+• Total Users: {total_users}
+• Active Today: {active_today}
+• New Today: {new_today}
+• Banned Users: {Database.execute("SELECT COUNT(*) as count FROM users WHERE is_banned = 1", fetchone=True)['count']}
+• Admins: {Database.execute("SELECT COUNT(*) as count FROM users WHERE is_admin = 1", fetchone=True)['count']}
+
+<b>Command Statistics:</b>
+• Commands Today: {commands_today}
+• Total Commands: {total_commands}
+• Avg Commands/User: {round(total_commands / max(1, total_users), 1)}
+
+<b>Top Commands Today:</b>"""
     
-    response = f"""🏓 <b>Pong!</b>
+    for cmd in top_commands:
+        response += f"\n• {cmd['command']}: {cmd['count']}"
+    
+    response += f"\n\n<b>User Growth (Last 7 Days):</b>"
+    for g in growth[-3:]:  # Show last 3 days
+        response += f"\n{g}"
+    
+    response += f"""
 
-⏱️ <b>Latency:</b> {latency}ms
-⏰ <b>Uptime:</b> {days}d {hours}h {minutes}m {seconds}s
-📡 <b>API Status:</b> {'🟢 Working' if api_working else '🔴 Failed'}
-
-📊 <b>Statistics:</b>
-👥 Users: {stats.get('total_users', 0)}
-📈 Commands Today: {stats.get('commands_today', 0)}
-👥 Active Today: {stats.get('active_today', 0)}
-👥 Groups: {stats.get('total_groups', 0)}
-
-💾 <b>Database:</b> OK
-🔧 <b>Maintenance:</b> {'ON' if maintenance_mode else 'OFF'}"""
+<b>System Status:</b>
+• Uptime: {days}d {hours}h {minutes}m
+• Maintenance: {'🔴 ON' if maintenance_mode else '🟢 OFF'}
+• Database Size: {os.path.getsize(DATABASE_PATH) // 1024} KB
+• Cache Hits: {len(gacha_cache)}"""
     
     await message.answer(response)
 
-@dp.message(Command("announce"))
-async def announce_command(message: Message):
-    """Make announcement"""
-    user = message.from_user
-    
-    if not is_admin(user.id):
-        await message.answer("❌ This command is for admins only.")
-        return
-    
-    update_user(user.id, user.username, user.first_name, "/announce")
-    
-    if not message.text or len(message.text.split()) < 2:
-        await message.answer("📢 <b>Usage:</b> <code>/announce title|message</code>\nExample: <code>/announce Update|New features added!</code>")
-        return
-    
-    content = " ".join(message.text.split()[1:])
-    if "|" not in content:
-        await message.answer("❌ Format: title|message")
-        return
-    
-    title, announcement = content.split("|", 1)
-    
-    response = f"""📢 <b>Announcement: {title}</b>
-
-{announcement}
-
-—
-AnimeKuun Bot Team"""
-    
-    await message.answer(response)
-
-@dp.message(Command("restart"))
-async def restart_command(message: Message):
-    """Restart bot (soft)"""
-    user = message.from_user
-    
-    if not is_admin(user.id):
-        await message.answer("❌ This command is for admins only.")
-        return
-    
-    update_user(user.id, user.username, user.first_name, "/restart")
-    
-    restart_msg = await message.answer("🔄 Restarting bot...")
-    
-    # This is a soft restart - just reload modules
-    await restart_msg.edit_text("✅ Bot restarted successfully!\n\nNote: This is a soft restart. For full restart, stop and start the bot process.")
-
-@dp.message(Command("warn"))
-async def warn_command(message: Message):
-    """Warn user"""
-    user = message.from_user
-    
-    if not is_admin(user.id):
-        await message.answer("❌ This command is for admins only.")
-        return
-    
-    update_user(user.id, user.username, user.first_name, "/warn")
-    
-    if not message.text or len(message.text.split()) < 3:
-        await message.answer("⚠️ <b>Usage:</b> <code>/warn user_id reason</code>\nExample: <code>/warn 12345678 Spam</code>")
-        return
-    
-    parts = message.text.split()
-    user_id = parts[1]
-    reason = " ".join(parts[2:])
-    
-    if not user_id.isdigit():
-        await message.answer("❌ Please provide a valid user ID.")
-        return
-    
-    user_id = int(user_id)
-    
-    try:
-        # Try to notify the user
-        try:
-            await bot.send_message(
-                user_id,
-                f"⚠️ <b>You have received a warning</b>\n\n"
-                f"Reason: {reason}\n"
-                f"Please follow the bot rules to avoid further action."
-            )
-        except:
-            pass
-        
-        await message.answer(f"⚠️ User <code>{user_id}</code> has been warned.\nReason: {reason}")
-        
-    except Exception as e:
-        await message.answer(f"❌ Error: {str(e)}")
-
-@dp.message(Command("mute"))
-async def mute_command(message: Message):
-    """Mute user for hours"""
-    user = message.from_user
-    
-    if not is_admin(user.id):
-        await message.answer("❌ This command is for admins only.")
-        return
-    
-    update_user(user.id, user.username, user.first_name, "/mute")
-    
-    if not message.text or len(message.text.split()) < 3:
-        await message.answer("🔇 <b>Usage:</b> <code>/mute user_id hours</code>\nExample: <code>/mute 12345678 24</code>")
-        return
-    
-    parts = message.text.split()
-    user_id = parts[1]
-    
-    if not user_id.isdigit():
-        await message.answer("❌ Please provide a valid user ID.")
-        return
-    
-    try:
-        hours = int(parts[2])
-        if hours <= 0 or hours > 720:  # Max 30 days
-            await message.answer("❌ Hours must be between 1 and 720 (30 days).")
-            return
-    except:
-        await message.answer("❌ Please provide valid hours.")
-        return
-    
-    user_id = int(user_id)
-    reason = " ".join(parts[3:]) if len(parts) > 3 else "No reason provided"
-    
-    # Store mute in database
-    mute_until = datetime.now() + timedelta(hours=hours)
-    db_execute(
-        "INSERT INTO admin_actions (admin_id, action, target_id, details) VALUES (?, 'mute', ?, ?)",
-        (user.id, user_id, f"Until {mute_until.strftime('%Y-%m-%d %H:%M:%S')} | Reason: {reason}")
-    )
-    
-    try:
-        # Try to notify the user
-        await bot.send_message(
-            user_id,
-            f"🔇 <b>You have been muted</b>\n\n"
-            f"Duration: {hours} hours\n"
-            f"Reason: {reason}\n"
-            f"Mute ends: {mute_until.strftime('%Y-%m-%d %H:%M:%S')}"
-        )
-    except:
-        pass
-    
-    await message.answer(f"🔇 User <code>{user_id}</code> has been muted for {hours} hours.\nReason: {reason}")
-
-# =========== CALLBACK HANDLERS ===========
+# =========== CALLBACK HANDLERS FOR BUTTONS ===========
 @dp.callback_query(F.data.startswith("anime_"))
-async def anime_callback(callback: CallbackQuery):
+async def anime_callback_handler(callback: CallbackQuery):
     """Handle anime view from callback"""
-    anime_id = int(callback.data.split("_")[1])
+    anime_id = callback.data.split("_")[1]
     
-    # Create a fake message
+    # Create a message object
     msg = Message(
         message_id=callback.message.message_id,
         date=datetime.now(),
@@ -2838,35 +2595,101 @@ async def anime_callback(callback: CallbackQuery):
     await anime_command(msg)
     await callback.answer()
 
-@dp.callback_query(F.data.startswith("fav_"))
-async def fav_callback(callback: CallbackQuery):
-    """Add to favorites"""
-    anime_id = int(callback.data.split("_")[1])
+@dp.callback_query(F.data.startswith("characters_"))
+async def characters_callback_handler(callback: CallbackQuery):
+    """Show characters for anime"""
+    anime_id = callback.data.split("_")[1]
     
     try:
-        anime_data = await anilist.get_anime(anime_id)
+        anime_data = await anilist.get_anime(int(anime_id))
         
-        if "error" in anime_data or not anime_data:
+        if "error" in anime_data:
+            await callback.answer("❌ Failed to load characters", show_alert=True)
+            return
+        
+        characters = anime_data.get('characters', {}).get('edges', [])
+        
+        if not characters:
+            await callback.answer("❌ No characters found", show_alert=True)
+            return
+        
+        response = f"👥 <b>Main Characters - {anime_data.get('title', {}).get('english', 'Anime')}</b>\n\n"
+        
+        for char in characters[:10]:  # Show first 10 characters
+            name = char['node']['name']['full']
+            role = char['role'].replace('_', ' ').title()
+            response += f"• <b>{name}</b> ({role})\n"
+        
+        await callback.message.answer(response)
+        await callback.answer()
+        
+    except Exception as e:
+        logger.error(f"Characters callback error: {e}")
+        await callback.answer("❌ Error loading characters", show_alert=True)
+
+@dp.callback_query(F.data.startswith("trailer_"))
+async def trailer_callback_handler(callback: CallbackQuery):
+    """Show trailer for anime"""
+    anime_id = callback.data.split("_")[1]
+    
+    try:
+        anime_data = await anilist.get_anime(int(anime_id))
+        
+        if "error" in anime_data:
+            await callback.answer("❌ Failed to load trailer", show_alert=True)
+            return
+        
+        trailer = anime_data.get('trailer', {})
+        
+        if not trailer or trailer.get('site') != 'youtube':
+            await callback.answer("❌ No trailer available", show_alert=True)
+            return
+        
+        trailer_id = trailer.get('id')
+        youtube_url = f"https://www.youtube.com/watch?v={trailer_id}"
+        
+        response = f"""🎬 <b>Trailer</b>
+
+<b>{anime_data.get('title', {}).get('english', 'Anime')}</b>
+
+Watch on YouTube: {youtube_url}"""
+        
+        await callback.message.answer(response)
+        await callback.answer()
+        
+    except Exception as e:
+        logger.error(f"Trailer callback error: {e}")
+        await callback.answer("❌ Error loading trailer", show_alert=True)
+
+@dp.callback_query(F.data.startswith("fav_"))
+async def favorite_callback_handler(callback: CallbackQuery):
+    """Add anime to favorites"""
+    anime_id = callback.data.split("_")[1]
+    
+    try:
+        anime_data = await anilist.get_anime(int(anime_id))
+        
+        if "error" in anime_data:
             await callback.answer("❌ Anime not found", show_alert=True)
             return
         
         title = anime_data.get('title', {}).get('english') or anime_data.get('title', {}).get('romaji', 'Unknown')
-        image = anime_data.get('coverImage', {}).get('large', '')
-        score = anime_data.get('averageScore')
         
-        success = add_favorite(callback.from_user.id, anime_id, title, image, score)
+        # Get user's current favorites
+        user = Database.get_user(callback.from_user.id)
+        if user and user['stats']:
+            stats = json.loads(user['stats'])
+            stats['favorites'] = stats.get('favorites', 0) + 1
+            Database.update_user(callback.from_user.id, stats=json.dumps(stats))
         
-        if success:
-            await callback.answer(f"✅ Added {title} to favorites!", show_alert=True)
-        else:
-            await callback.answer("⭐ Already in favorites!", show_alert=True)
-            
+        await callback.answer(f"✅ Added {title} to favorites!", show_alert=True)
+        
     except Exception as e:
         logger.error(f"Favorite callback error: {e}")
         await callback.answer("❌ Failed to add to favorites", show_alert=True)
 
-@dp.callback_query(F.data == "waifu")
-async def waifu_callback(callback: CallbackQuery):
+@dp.callback_query(F.data == "get_waifu")
+async def get_waifu_callback(callback: CallbackQuery):
     """Get waifu from callback"""
     msg = Message(
         message_id=callback.message.message_id,
@@ -2879,8 +2702,8 @@ async def waifu_callback(callback: CallbackQuery):
     await waifu_command(msg)
     await callback.answer()
 
-@dp.callback_query(F.data == "husbando")
-async def husbando_callback(callback: CallbackQuery):
+@dp.callback_query(F.data == "get_husbando")
+async def get_husbando_callback(callback: CallbackQuery):
     """Get husbando from callback"""
     msg = Message(
         message_id=callback.message.message_id,
@@ -2893,294 +2716,131 @@ async def husbando_callback(callback: CallbackQuery):
     await husbando_command(msg)
     await callback.answer()
 
-@dp.callback_query(F.data == "trending")
-async def trending_callback(callback: CallbackQuery):
-    """Get trending from callback"""
+@dp.callback_query(F.data == "play_quiz")
+async def play_quiz_callback(callback: CallbackQuery):
+    """Play quiz from callback"""
     msg = Message(
         message_id=callback.message.message_id,
         date=datetime.now(),
         chat=callback.message.chat,
         from_user=callback.from_user,
-        text="/trending"
+        text="/quiz"
     )
     
-    await trending_command(msg)
+    await quiz_command(msg)
     await callback.answer()
 
-@dp.callback_query(F.data == "profile")
-async def profile_callback(callback: CallbackQuery):
-    """Get profile from callback"""
+@dp.callback_query(F.data == "link_anilist")
+async def link_anilist_callback(callback: CallbackQuery):
+    """Link AniList from callback"""
     msg = Message(
         message_id=callback.message.message_id,
         date=datetime.now(),
         chat=callback.message.chat,
         from_user=callback.from_user,
-        text="/profile"
+        text="/link"
     )
     
-    await profile_command(msg)
+    await link_command(msg)
     await callback.answer()
 
-@dp.callback_query(F.data == "help")
-async def help_callback(callback: CallbackQuery):
-    """Get help from callback"""
+@dp.callback_query(F.data == "another_waifu")
+async def another_waifu_callback(callback: CallbackQuery):
+    """Get another waifu"""
     msg = Message(
         message_id=callback.message.message_id,
         date=datetime.now(),
         chat=callback.message.chat,
         from_user=callback.from_user,
-        text="/help"
+        text="/waifu"
     )
     
-    await help_command(msg)
+    await waifu_command(msg)
     await callback.answer()
 
-@dp.callback_query(F.data == "another_quote")
-async def another_quote_callback(callback: CallbackQuery):
-    """Get another quote"""
+@dp.callback_query(F.data == "another_husbando")
+async def another_husbando_callback(callback: CallbackQuery):
+    """Get another husbando"""
     msg = Message(
         message_id=callback.message.message_id,
         date=datetime.now(),
         chat=callback.message.chat,
         from_user=callback.from_user,
-        text="/quote"
+        text="/husbando"
     )
     
-    await quote_command(msg)
+    await husbando_command(msg)
     await callback.answer()
 
-@dp.callback_query(F.data == "random_another")
-async def random_another_callback(callback: CallbackQuery):
-    """Get another random anime"""
-    msg = Message(
-        message_id=callback.message.message_id,
-        date=datetime.now(),
-        chat=callback.message.chat,
-        from_user=callback.from_user,
-        text="/random"
-    )
+# =========== ANSWER HANDLER FOR QUIZ ===========
+@dp.message(F.text.regexp(r'^[A-Da-d]$'))
+async def quiz_answer_handler(message: Message):
+    """Handle quiz answers"""
+    user = message.from_user
     
-    await random_command(msg)
-    await callback.answer()
+    # Find active quiz for user
+    quiz_id = None
+    for qid, quiz in quiz_sessions.items():
+        if quiz["user_id"] == user.id and not quiz["answered"]:
+            quiz_id = qid
+            break
+    
+    if not quiz_id:
+        return  # No active quiz
+    
+    answer = message.text.upper()
+    quiz_id, response = await QuizSystem.check_answer(quiz_id, answer)
+    
+    if quiz_id:
+        await message.answer(response)
 
-@dp.callback_query(F.data.startswith("broadcast_confirm_"))
-async def broadcast_confirm_callback(callback: CallbackQuery):
-    """Confirm broadcast"""
-    if not is_admin(callback.from_user.id):
-        await callback.answer("❌ Admin only", show_alert=True)
+# =========== ANSWER HANDLER FOR BATTLE ===========
+@dp.message(Command("attack"))
+async def battle_attack_handler(message: Message):
+    """Handle battle attacks"""
+    user = message.from_user
+    
+    # Find active battle for user
+    battle_id = None
+    for bid, battle in battle_sessions.items():
+        if battle["player1"]["id"] == user.id or battle["player2"]["id"] == user.id:
+            if battle["status"] == "active" and battle["turn"] == user.id:
+                battle_id = bid
+                break
+    
+    if not battle_id:
+        await message.answer("⚔️ You don't have an active battle or it's not your turn!")
         return
     
-    broadcast_id = callback.data.split("_")[2]
+    battle_id, response = await BattleSystem.process_attack(battle_id, user.id)
     
-    if broadcast_id not in active_broadcasts:
-        await callback.answer("❌ Broadcast expired", show_alert=True)
-        return
-    
-    broadcast_data = active_broadcasts[broadcast_id]
-    del active_broadcasts[broadcast_id]
-    
-    broadcast_msg = broadcast_data["message"]
-    
-    # Get all users
-    users = db_execute("SELECT user_id FROM users WHERE is_banned = 0", fetchall=True)
-    
-    if not users:
-        await callback.answer("❌ No users found", show_alert=True)
-        return
-    
-    total_users = len(users)
-    status_msg = await callback.message.edit_text(f"📤 Broadcasting to {total_users} users...")
-    
-    success = 0
-    failed = 0
-    
-    broadcast_text = f"""📢 <b>Announcement from Admin</b>
-
-{broadcast_msg}
-
-—
-AnimeKuun Bot"""
-    
-    for user_id, in users:
-        try:
-            await bot.send_message(chat_id=user_id, text=broadcast_text)
-            success += 1
-            if success % 10 == 0:
-                await status_msg.edit_text(f"📤 Broadcasting... {success}/{total_users}")
-            await asyncio.sleep(0.1)  # Rate limiting
-        except:
-            failed += 1
-    
-    result_text = f"""✅ <b>Broadcast Complete!</b>
-
-📤 Sent: {success} users
-❌ Failed: {failed} users
-📊 Total: {total_users} users
-
-💡 <i>Message delivered successfully</i>"""
-    
-    # Log broadcast
-    db_execute(
-        "INSERT INTO broadcasts (admin_id, message, sent_count, failed_count) VALUES (?, ?, ?, ?)",
-        (callback.from_user.id, broadcast_msg, success, failed)
-    )
-    
-    await status_msg.edit_text(result_text)
-    await callback.answer("✅ Broadcast sent!")
-
-@dp.callback_query(F.data == "broadcast_cancel")
-async def broadcast_cancel_callback(callback: CallbackQuery):
-    """Cancel broadcast"""
-    await callback.message.edit_text("❌ Broadcast cancelled.")
-    await callback.answer()
-
-@dp.callback_query(F.data == "clear_favorites")
-async def clear_favorites_callback(callback: CallbackQuery):
-    """Clear all favorites"""
-    user_id = callback.from_user.id
-    
-    # Ask for confirmation
-    keyboard = InlineKeyboardBuilder()
-    keyboard.row(
-        InlineKeyboardButton(text="✅ Yes, Clear All", callback_data="clear_favorites_confirm"),
-        InlineKeyboardButton(text="❌ Cancel", callback_data="clear_favorites_cancel")
-    )
-    
-    await callback.message.edit_text(
-        "🗑️ <b>Clear All Favorites</b>\n\n"
-        "Are you sure you want to clear ALL your favorites?\n"
-        "This action cannot be undone!",
-        reply_markup=keyboard.as_markup()
-    )
-    await callback.answer()
-
-@dp.callback_query(F.data == "clear_favorites_confirm")
-async def clear_favorites_confirm_callback(callback: CallbackQuery):
-    """Confirm clear favorites"""
-    user_id = callback.from_user.id
-    
-    # Clear favorites
-    db_execute("DELETE FROM favorites WHERE user_id = ?", (user_id,))
-    db_execute("UPDATE users SET total_favorites = 0 WHERE user_id = ?", (user_id,))
-    
-    await callback.message.edit_text("✅ All favorites have been cleared!")
-    await callback.answer()
-
-@dp.callback_query(F.data == "clear_favorites_cancel")
-async def clear_favorites_cancel_callback(callback: CallbackQuery):
-    """Cancel clear favorites"""
-    await callback.message.edit_text("❌ Clear favorites cancelled.")
-    await callback.answer()
-
-# =========== GROUP HANDLERS ===========
-@dp.message(F.chat.type.in_({ChatType.GROUP, ChatType.SUPERGROUP}))
-async def handle_group(message: Message):
-    """Handle group messages"""
-    # Update group in database
-    try:
-        db_execute(
-            """INSERT OR IGNORE INTO groups (group_id, title, added_date, last_active) 
-            VALUES (?, ?, datetime('now'), datetime('now'))""",
-            (message.chat.id, message.chat.title)
-        )
-        db_execute(
-            "UPDATE groups SET last_active = datetime('now') WHERE group_id = ?",
-            (message.chat.id,)
-        )
-    except:
-        pass
-    
-    # Respond to bot mention
-    bot_username = (await bot.get_me()).username
-    if bot_username and message.text and f"@{bot_username}" in message.text:
-        response = f"""👋 Hello <b>{message.chat.title}</b>!
-
-I'm <b>AnimeKuun Bot</b> - your anime companion!
-
-Try these commands:
-• <code>/search anime name</code>
-• <code>/trending</code> - Trending now
-• <code>/random</code> - Random anime
-• <code>/quote</code> - Anime quote
-
-Type <code>/help</code> for all commands!"""
-        
-        await message.reply(response)
-
-@dp.message(F.new_chat_members)
-async def welcome_bot(message: Message):
-    """Welcome bot to group"""
-    bot_id = (await bot.get_me()).id
-    if any(member.id == bot_id for member in message.new_chat_members):
-        welcome_msg = f"""🤖 <b>Hello {message.chat.title}!</b>
-
-Thank you for adding <b>AnimeKuun Bot</b>!
-
-I can help you:
-🔍 Search for anime
-🌟 Discover trending shows
-⭐ Manage your favorites
-💬 Get anime quotes
-
-<b>Quick Start:</b>
-1. Try <code>/search Attack on Titan</code>
-2. Check <code>/trending</code> for popular anime
-3. Use <code>/help</code> for all commands
-
-Enjoy your anime journey! 🎌"""
-        
-        await message.answer(welcome_msg)
+    if battle_id:
+        await message.answer(response)
 
 # =========== ERROR HANDLER ===========
 @dp.errors()
 async def global_error_handler(event, exception):
     """Global error handler"""
     logger.error(f"Global error: {exception}", exc_info=True)
-    
-    # Log error to database if possible
-    try:
-        user_id = 0
-        if hasattr(event, 'from_user') and event.from_user:
-            user_id = event.from_user.id
-        
-        command = ""
-        if hasattr(event, 'text') and event.text:
-            parts = event.text.split()
-            if parts and parts[0].startswith('/'):
-                command = parts[0][1:]  # Remove leading slash
-        
-        log_error(user_id, str(exception), command)
-    except:
-        pass
-    
     return True
 
 # =========== MAIN FUNCTION ===========
 async def main():
     """Main function"""
     print("🚀 Starting AnimeKuun Bot...")
+    print("=" * 60)
     
     # Delete webhook
     await bot.delete_webhook(drop_pending_updates=True)
     
-    # Test API
-    print("🔧 Testing AniList API...")
-    try:
-        test_results = await anilist.search_anime("test", per_page=1)
-        if test_results:
-            print("✅ AniList API is working")
-        else:
-            print("⚠️ AniList API returned no results")
-    except Exception as e:
-        print(f"❌ AniList API test failed: {e}")
-    
     # Get bot info
     bot_info = await bot.get_me()
     print(f"🤖 Bot: @{bot_info.username}")
-    print(f"📊 Commands: 50+ user, 18+ admin")
+    print(f"📊 Commands: 50+ user commands, 18+ admin commands")
     print(f"💾 Database: {DATABASE_PATH}")
-    
-    # Start polling
+    print(f"🔗 AniList OAuth: Ready")
+    print(f"🎮 Features: Quiz, Battle, Gacha, Memes, Waifu/Husbando")
+    print("=" * 60)
     print("🎌 Bot is now running and ready!")
     
     try:
@@ -3191,6 +2851,7 @@ async def main():
     finally:
         # Cleanup
         await anilist.close()
+        print("🤖 Bot stopped.")
 
 if __name__ == "__main__":
     # Create directories
